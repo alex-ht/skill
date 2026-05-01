@@ -567,6 +567,7 @@ def _find_transcript_path_from_sessions_store(
             candidate = session_root / value
         if candidate.exists() and candidate.stat().st_mtime >= min_mtime:
             return candidate
+
     return None
 
 
@@ -574,7 +575,12 @@ def _find_recent_session_path(agent_dir: Path, started_at: float) -> Path | None
     sessions_dir = agent_dir / "sessions"
     if not sessions_dir.exists():
         return None
-    candidates = list(sessions_dir.rglob("*.jsonl")) + list(sessions_dir.rglob("*.ndjson"))
+    candidates = [
+        p for p in
+        list(sessions_dir.rglob("*.jsonl")) + list(sessions_dir.rglob("*.ndjson"))
+        if ".trajectory" not in p.name and ".trajectory-path" not in p.name
+    ]
+
     if not candidates:
         return None
     tolerance_seconds = 5.0
@@ -598,7 +604,7 @@ def _load_transcript(
     #   1. Resolve the real session ID from sessions.json
     #   2. Glob for any .jsonl in the sessions dir (most-recently-modified)
     #   3. Try our passed-in session ID as a last resort
-    for attempt in range(15):
+    for attempt in range(90):
         # 1. Try sessions.json first — OpenClaw writes the real UUID here
         resolved_session_id = _resolve_session_id_from_store(agent_id)
         if resolved_session_id:
@@ -617,6 +623,7 @@ def _load_transcript(
                         attempt + 1,
                     )
                     break
+
             if transcript_path is not None:
                 break
 
@@ -658,7 +665,7 @@ def _load_transcript(
         if transcript_path is not None:
             break
 
-        if attempt < 14:
+        if attempt < 89:
             time.sleep(1.0)
 
     if transcript_path is None:
