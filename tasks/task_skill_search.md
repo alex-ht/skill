@@ -1,7 +1,7 @@
 ---
 id: task_skill_search
 name: Search and Replace in Files
-category: file_ops
+category: skills
 grading_type: automated
 timeout_seconds: 180
 workspace_files:

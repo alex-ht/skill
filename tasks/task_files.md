@@ -1,7 +1,7 @@
 ---
 id: task_files
 name: File Structure Creation
-category: file_ops
+category: skills
 grading_type: automated
 timeout_seconds: 120
 workspace_files: []

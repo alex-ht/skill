@@ -1,7 +1,7 @@
 ---
 id: task_log_apache_critical
 name: Apache Error Log - Identify Critical Security Issues
-category: logs
+category: log_analysis
 grading_type: hybrid
 timeout_seconds: 180
 workspace_files:

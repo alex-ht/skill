@@ -1,7 +1,7 @@
 ---
 id: task_meeting_tech_competitors
 name: Meeting Competitor Analysis Extraction
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

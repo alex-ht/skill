@@ -1,7 +1,7 @@
 ---
 id: task_meeting_council_contact_info
 name: Tampa City Council – Extract Contact Information
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

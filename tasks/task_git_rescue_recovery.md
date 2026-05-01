@@ -1,7 +1,7 @@
 ---
 id: task_git_rescue_recovery
 name: Git Rescue / Recovery
-category: developer
+category: coding
 grading_type: automated
 timeout_seconds: 120
 workspace_files: []

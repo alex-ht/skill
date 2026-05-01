@@ -1,7 +1,7 @@
 ---
 id: task_csv_iris_outliers
 name: Iris Flowers Outlier Detection
-category: data-analysis
+category: csv_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

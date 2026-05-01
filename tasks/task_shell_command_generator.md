@@ -1,7 +1,7 @@
 ---
 id: task_shell_command_generator
 name: Shell Command Generator
-category: developer
+category: coding
 grading_type: automated
 timeout_seconds: 90
 workspace_files: []

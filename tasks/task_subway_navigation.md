@@ -1,7 +1,7 @@
 ---
 id: task_subway_navigation
 name: NYC Subway Navigation
-category: navigation
+category: productivity
 grading_type: llm_judge
 timeout_seconds: 180
 workspace_files:

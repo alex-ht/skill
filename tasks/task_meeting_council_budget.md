@@ -1,7 +1,7 @@
 ---
 id: task_meeting_council_budget
 name: Tampa City Council – Extract Budget Discussions
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

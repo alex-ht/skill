@@ -1,7 +1,7 @@
 ---
 id: task_k8s_debugging
 name: K8s/IaC Debugging
-category: devops
+category: coding
 grading_type: automated
 timeout_seconds: 120
 workspace_files:

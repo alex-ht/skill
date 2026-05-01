@@ -1,7 +1,7 @@
 ---
 id: task_meeting_advisory_attendees
 name: NTIA Advisory Board Attendee List
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

@@ -1,7 +1,7 @@
 ---
 id: task_selector_fix
 name: Test Maintenance / Selector Fix
-category: developer
+category: coding
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

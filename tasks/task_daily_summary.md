@@ -1,7 +1,7 @@
 ---
 id: task_daily_summary
 name: Daily Research Summary Generation
-category: synthesis
+category: productivity
 grading_type: llm_judge
 timeout_seconds: 300
 workspace_files:

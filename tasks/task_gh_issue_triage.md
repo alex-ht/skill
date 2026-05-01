@@ -1,7 +1,7 @@
 ---
 id: task_gh_issue_triage
 name: GitHub Issue Triage
-category: github
+category: skills
 grading_type: hybrid
 timeout_seconds: 300
 grading_weights:

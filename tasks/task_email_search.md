@@ -1,7 +1,7 @@
 ---
 id: task_email_search
 name: Email Search and Summarization
-category: comprehension
+category: analysis
 grading_type: hybrid
 timeout_seconds: 240
 grading_weights:

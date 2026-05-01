@@ -1,7 +1,7 @@
 ---
 id: task_commit_message_writer
 name: Commit Message Writer
-category: developer
+category: writing
 grading_type: llm_judge
 timeout_seconds: 120
 workspace_files:

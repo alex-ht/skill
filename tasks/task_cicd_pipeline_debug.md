@@ -1,7 +1,7 @@
 ---
 id: task_cicd_pipeline_debug
 name: CI/CD Pipeline Debug
-category: devops
+category: coding
 grading_type: automated
 timeout_seconds: 120
 workspace_files:

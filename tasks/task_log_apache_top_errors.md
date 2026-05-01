@@ -1,7 +1,7 @@
 ---
 id: task_log_apache_top_errors
 name: Apache Error Log - Rank Top Error Types
-category: logs
+category: log_analysis
 grading_type: hybrid
 timeout_seconds: 180
 workspace_files:

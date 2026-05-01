@@ -1,7 +1,7 @@
 ---
 id: task_browser_automation
 name: Browser Automation Workflow
-category: developer
+category: coding
 grading_type: hybrid
 timeout_seconds: 180
 workspace_files:

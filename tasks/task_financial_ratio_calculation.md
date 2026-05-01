@@ -1,7 +1,7 @@
 ---
 id: task_financial_ratio_calculation
 name: Financial Ratio Calculation
-category: finance
+category: analysis
 grading_type: automated
 timeout_seconds: 240
 workspace_files: []

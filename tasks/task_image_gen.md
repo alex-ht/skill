@@ -1,7 +1,7 @@
 ---
 id: task_image_gen
 name: AI Image Generation
-category: creative
+category: skills
 grading_type: hybrid
 timeout_seconds: 120
 workspace_files: []

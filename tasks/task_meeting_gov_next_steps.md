@@ -1,7 +1,7 @@
 ---
 id: task_meeting_gov_next_steps
 name: NASA UAP Hearing Next Steps Extraction
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

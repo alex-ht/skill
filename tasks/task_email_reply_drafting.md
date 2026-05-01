@@ -1,7 +1,7 @@
 ---
 id: task_email_reply_drafting
 name: Email Reply Drafting from Unread Inbox
-category: email
+category: writing
 grading_type: llm_judge
 timeout_seconds: 240
 workspace_files:

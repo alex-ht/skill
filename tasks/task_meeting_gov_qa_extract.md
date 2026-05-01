@@ -1,7 +1,7 @@
 ---
 id: task_meeting_gov_qa_extract
 name: NASA UAP Hearing Q&A Extraction
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

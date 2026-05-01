@@ -1,7 +1,7 @@
 ---
 id: task_csv_gdp_ranking
 name: World GDP Country Ranking
-category: data-analysis
+category: csv_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

@@ -1,7 +1,7 @@
 ---
 id: task_multi_file_refactoring
 name: Multi-file Refactoring
-category: developer
+category: coding
 grading_type: automated
 timeout_seconds: 120
 workspace_files:

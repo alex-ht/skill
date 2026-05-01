@@ -1,7 +1,7 @@
 ---
 id: task_csv_gdp_per_capita
 name: World GDP Per Capita Estimation
-category: data-analysis
+category: csv_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

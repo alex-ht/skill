@@ -1,7 +1,7 @@
 ---
 id: task_csv_iris_classify
 name: Iris Species Classification Rules
-category: data-analysis
+category: csv_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

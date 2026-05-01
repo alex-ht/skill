@@ -1,7 +1,7 @@
 ---
 id: task_csv_iris_summary
 name: Iris Flowers Statistical Summary
-category: data-analysis
+category: csv_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

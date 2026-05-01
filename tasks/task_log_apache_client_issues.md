@@ -1,7 +1,7 @@
 ---
 id: task_log_apache_client_issues
 name: Apache Error Log - Identify Problematic Client IPs
-category: logs
+category: log_analysis
 grading_type: hybrid
 timeout_seconds: 180
 workspace_files:

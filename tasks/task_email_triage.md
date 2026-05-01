@@ -1,7 +1,7 @@
 ---
 id: task_email_triage
 name: Email Inbox Triage
-category: organization
+category: productivity
 grading_type: hybrid
 timeout_seconds: 240
 grading_weights:

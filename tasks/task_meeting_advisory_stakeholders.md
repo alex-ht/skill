@@ -1,7 +1,7 @@
 ---
 id: task_meeting_advisory_stakeholders
 name: NTIA Advisory Board Stakeholder Interests
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

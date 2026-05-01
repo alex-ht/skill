@@ -1,7 +1,7 @@
 ---
 id: task_openclaw_comprehension
 name: OpenClaw Report Comprehension
-category: comprehension
+category: analysis
 grading_type: automated
 timeout_seconds: 300
 workspace_files:

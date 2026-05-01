@@ -1,7 +1,7 @@
 ---
 id: task_meeting_sentiment_analysis
 name: Meeting Sentiment Analysis
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

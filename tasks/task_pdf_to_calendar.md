@@ -1,7 +1,7 @@
 ---
 id: task_pdf_to_calendar
 name: PDF to Calendar Import
-category: calendar
+category: productivity
 grading_type: automated
 timeout_seconds: 180
 workspace_files:

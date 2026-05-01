@@ -1,7 +1,7 @@
 ---
 id: task_meeting_gov_recommendations
 name: NASA UAP Hearing Panel Recommendations
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

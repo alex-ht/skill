@@ -1,7 +1,7 @@
 ---
 id: task_meeting_advisory_technical
 name: NTIA Advisory Board Technical Discussions
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

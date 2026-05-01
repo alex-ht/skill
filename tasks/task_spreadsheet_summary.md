@@ -1,7 +1,7 @@
 ---
 id: task_spreadsheet_summary
 name: CSV and Excel Data Summarization
-category: data_analysis
+category: analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

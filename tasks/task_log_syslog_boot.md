@@ -1,7 +1,7 @@
 ---
 id: task_log_syslog_boot
 name: Linux Syslog Boot Sequence Analysis
-category: logs
+category: log_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

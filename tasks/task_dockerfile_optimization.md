@@ -1,7 +1,7 @@
 ---
 id: task_dockerfile_optimization
 name: Dockerfile Optimization
-category: devops
+category: coding
 grading_type: automated
 timeout_seconds: 120
 workspace_files:

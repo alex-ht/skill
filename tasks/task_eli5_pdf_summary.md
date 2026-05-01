@@ -1,7 +1,7 @@
 ---
 id: task_eli5_pdf_summary
 name: ELI5 PDF Summarization
-category: comprehension
+category: analysis
 grading_type: llm_judge
 timeout_seconds: 300
 workspace_files:

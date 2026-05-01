@@ -1,7 +1,7 @@
 ---
 id: task_memory
 name: Memory Retrieval from Context
-category: context
+category: memory
 grading_type: automated
 timeout_seconds: 120
 workspace_files:

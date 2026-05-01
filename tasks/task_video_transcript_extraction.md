@@ -1,7 +1,7 @@
 ---
 id: task_video_transcript_extraction
 name: Video Transcript Extraction and Summary
-category: research
+category: coding
 grading_type: llm_judge
 timeout_seconds: 300
 workspace_files: []

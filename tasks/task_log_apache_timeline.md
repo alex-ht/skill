@@ -1,7 +1,7 @@
 ---
 id: task_log_apache_timeline
 name: Apache Error Log - Create Error Timeline
-category: logs
+category: log_analysis
 grading_type: hybrid
 timeout_seconds: 180
 workspace_files:

@@ -1,7 +1,7 @@
 ---
 id: task_csv_life_exp_ranking
 name: Life Expectancy Country Ranking
-category: data-analysis
+category: csv_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

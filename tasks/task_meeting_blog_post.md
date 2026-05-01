@@ -1,7 +1,7 @@
 ---
 id: task_meeting_blog_post
 name: Meeting to Blog Post
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

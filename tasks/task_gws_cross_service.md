@@ -1,7 +1,7 @@
 ---
 id: task_gws_cross_service
 name: GWS Cross-Service Workflow
-category: gws
+category: integrations
 grading_type: hybrid
 timeout_seconds: 300
 grading_weights:

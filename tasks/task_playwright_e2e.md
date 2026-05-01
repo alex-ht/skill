@@ -1,7 +1,7 @@
 ---
 id: task_playwright_e2e
 name: Playwright E2E Form Test
-category: automation
+category: coding
 grading_type: hybrid
 timeout_seconds: 300
 workspace_files:

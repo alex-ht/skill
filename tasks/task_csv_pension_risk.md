@@ -1,7 +1,7 @@
 ---
 id: task_csv_pension_risk
 name: US Pension Fund Risk Assessment
-category: data-analysis
+category: csv_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

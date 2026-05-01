@@ -1,7 +1,7 @@
 ---
 id: task_meeting_gov_data_sources
 name: NASA UAP Hearing Data Sources Extraction
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

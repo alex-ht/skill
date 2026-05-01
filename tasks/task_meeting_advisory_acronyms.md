@@ -1,7 +1,7 @@
 ---
 id: task_meeting_advisory_acronyms
 name: NTIA Advisory Board Acronym Glossary
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

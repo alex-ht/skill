@@ -1,7 +1,7 @@
 ---
 id: task_gws_task_management
 name: GWS Task Management
-category: gws
+category: integrations
 grading_type: hybrid
 timeout_seconds: 300
 grading_weights:

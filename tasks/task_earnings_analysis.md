@@ -1,7 +1,7 @@
 ---
 id: task_earnings_analysis
 name: Earnings Analysis
-category: finance
+category: analysis
 grading_type: automated
 timeout_seconds: 240
 workspace_files: []

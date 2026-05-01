@@ -1,7 +1,7 @@
 ---
 id: task_gws_email_triage
 name: GWS Email Triage
-category: gws
+category: integrations
 grading_type: hybrid
 timeout_seconds: 300
 grading_weights:

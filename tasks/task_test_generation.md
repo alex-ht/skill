@@ -1,7 +1,7 @@
 ---
 id: task_test_generation
 name: Test Generation
-category: developer
+category: coding
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

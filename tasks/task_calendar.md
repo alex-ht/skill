@@ -1,7 +1,7 @@
 ---
 id: task_calendar
 name: Calendar Event Creation
-category: calendar
+category: productivity
 grading_type: automated
 timeout_seconds: 120
 workspace_files: []

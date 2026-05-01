@@ -1,7 +1,7 @@
 ---
 id: task_meeting_executive_summary
 name: Meeting Executive Summary
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

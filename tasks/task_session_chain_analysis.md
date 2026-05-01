@@ -1,7 +1,7 @@
 ---
 id: task_session_chain_analysis
 name: Session Chain Analysis & Design Review
-category: coding
+category: analysis
 grading_type: automated
 timeout_seconds: 300
 multi_session: true

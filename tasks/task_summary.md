@@ -1,7 +1,7 @@
 ---
 id: task_summary
 name: Document Summarization
-category: comprehension
+category: analysis
 grading_type: llm_judge
 timeout_seconds: 240
 workspace_files:

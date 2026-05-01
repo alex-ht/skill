@@ -1,7 +1,7 @@
 ---
 id: task_meeting_council_votes
 name: Tampa City Council – List Motions and Vote Outcomes
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

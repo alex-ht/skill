@@ -1,7 +1,7 @@
 ---
 id: task_log_apache_error_summary
 name: Apache Error Log - Generate Error Summary Report
-category: logs
+category: log_analysis
 grading_type: hybrid
 timeout_seconds: 180
 workspace_files:

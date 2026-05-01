@@ -1,7 +1,7 @@
 ---
 id: task_csv_cities_filter
 name: US Cities Multi-Criteria Filtering
-category: data-analysis
+category: csv_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

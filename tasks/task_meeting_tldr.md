@@ -1,7 +1,7 @@
 ---
 id: task_meeting_tldr
 name: Meeting TL;DR
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

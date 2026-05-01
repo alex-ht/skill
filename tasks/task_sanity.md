@@ -1,7 +1,7 @@
 ---
 id: task_sanity
 name: Sanity Check
-category: basic
+category: productivity
 grading_type: automated
 timeout_seconds: 60
 workspace_files: []

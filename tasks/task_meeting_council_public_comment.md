@@ -1,7 +1,7 @@
 ---
 id: task_meeting_council_public_comment
 name: Tampa City Council – Summarize Public Comments
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

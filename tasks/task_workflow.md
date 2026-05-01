@@ -1,7 +1,7 @@
 ---
 id: task_workflow
 name: Multi-step API Workflow
-category: complex
+category: skills
 grading_type: hybrid
 timeout_seconds: 300
 workspace_files:

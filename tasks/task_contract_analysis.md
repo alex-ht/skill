@@ -1,7 +1,7 @@
 ---
 id: task_contract_analysis
 name: Contract/Legal Analysis
-category: image_docs
+category: analysis
 grading_type: llm_judge
 timeout_seconds: 300
 workspace_files:

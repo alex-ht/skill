@@ -1,7 +1,7 @@
 ---
 id: task_cve_security_triage
 name: CVE/Security Triage
-category: security
+category: analysis
 grading_type: hybrid
 timeout_seconds: 300
 grading_weights:

@@ -1,7 +1,7 @@
 ---
 id: task_meeting_searchable_index
 name: Meeting Searchable Index
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

@@ -1,7 +1,7 @@
 ---
 id: task_meeting_council_upcoming
 name: Tampa City Council – Extract Upcoming Events and Deadlines
-category: meeting
+category: meeting_analysis
 grading_type: hybrid
 timeout_seconds: 180
 grading_weights:

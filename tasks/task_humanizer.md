@@ -1,7 +1,7 @@
 ---
 id: task_humanizer
 name: Humanize AI-Generated Blog
-category: content_transformation
+category: writing
 grading_type: llm_judge
 timeout_seconds: 120
 workspace_files:

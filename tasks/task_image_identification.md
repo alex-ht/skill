@@ -1,7 +1,7 @@
 ---
 id: task_image_identification
 name: Image Identification (Phone, Food, Menu)
-category: image_docs
+category: analysis
 grading_type: automated
 timeout_seconds: 150
 workspace_files:

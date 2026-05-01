@@ -1,7 +1,7 @@
 ---
 id: task_readme_generation
 name: README Generation
-category: developer
+category: writing
 grading_type: llm_judge
 timeout_seconds: 180
 workspace_files:
