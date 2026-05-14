@@ -534,7 +534,7 @@ def _read_workspace_files(workspace_path: str) -> str:
             continue
         try:
             content = f.read_text(encoding="utf-8")
-            file_contents.append(f"### File: {rel}\n{content[:3000]}")
+            file_contents.append(f"### File: {rel}\n{content}")
         except (OSError, UnicodeDecodeError):
             pass
     return "\n\n".join(file_contents)
