@@ -418,7 +418,7 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
         logger.warning("Could not find agent workspace, using fallback")
         workspace = Path(f"/tmp/pinchbench/{run_id}/{task.task_id}")
 
-    _BOOTSTRAP_FILES = ["SOUL.md", "BOOTSTRAP.md", "USER.md", "IDENTITY.md", "HEARTBEAT.md", "TOOLS.md"]
+    _BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "BOOTSTRAP.md", "USER.md", "IDENTITY.md", "HEARTBEAT.md", "TOOLS.md"]
 
     def _remove_readonly(func, path, _):
         try:
@@ -471,6 +471,14 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
                     shutil.rmtree(dest_skill_dir, onerror=_remove_readonly)
                 shutil.copytree(skill_dir_src, dest_skill_dir)
                 logger.info("Copied skill to benchmark workspace: %s", skill_dir_src.name)
+
+    main_workspace = Path.home() / ".openclaw" / "workspace"
+    for fname in _BOOTSTRAP_FILES:
+        main_file = main_workspace / fname
+        if main_file.exists():
+            dest = workspace / fname
+            dest.write_bytes(main_file.read_bytes())
+            logger.info("Copied bootstrap file to benchmark workspace: %s", fname)
 
     return workspace
 
