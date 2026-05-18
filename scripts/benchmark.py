@@ -246,12 +246,28 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--base-url",
         default=None,
-        help="Custom OpenAI-compatible API base URL (bypasses OpenRouter validation)",
+        help="Custom OpenAI-compatible API base URL for the benchmarked agent model (bypasses OpenRouter validation)",
     )
     parser.add_argument(
         "--api-key",
         default=None,
-        help="API key for custom endpoint (default: $OPENAI_API_KEY env var)",
+        help="API key for the benchmarked agent's custom endpoint (default: $OPENAI_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--judge-base-url",
+        default=None,
+        help=(
+            "Custom OpenAI-compatible API base URL for the judge model. "
+            "Accepts either a full /chat/completions endpoint or a base URL like .../v1."
+        ),
+    )
+    parser.add_argument(
+        "--judge-api-key",
+        default=None,
+        help=(
+            "API key for the judge custom endpoint "
+            "(default: $JUDGE_API_KEY, then $AZURE_OPENAI_API_KEY for Azure URLs, then $OPENAI_API_KEY)"
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -719,6 +735,88 @@ def _snapshot_workspace_for_grading(execution_result: Dict[str, Any]) -> Dict[st
     return snapshot_result
 
 
+def _judge_backend_name(model: str, judge_base_url: Optional[str] = None) -> str:
+    if judge_base_url:
+        return "openai_compat_custom"
+    if model == "claude" or model.startswith("claude:"):
+        return "claude_cli"
+    if model.startswith("anthropic/"):
+        return "anthropic"
+    if model.startswith("openai/"):
+        return "openai"
+    return "openrouter"
+
+
+def _resolve_custom_judge_api_key(judge_base_url: str, judge_api_key: Optional[str]) -> Optional[str]:
+    if judge_api_key:
+        return judge_api_key
+    if os.environ.get("JUDGE_API_KEY"):
+        return os.environ.get("JUDGE_API_KEY")
+    base = judge_base_url.lower()
+    if ".openai.azure.com" in base or "azure.com" in base:
+        return os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    return os.environ.get("OPENAI_API_KEY")
+
+
+def _validate_direct_judge_configuration(
+    judge_model: Optional[str],
+    *,
+    judge_base_url: Optional[str] = None,
+    judge_api_key: Optional[str] = None,
+) -> None:
+    """Fail fast when a direct judge model would route to the wrong backend.
+
+    `--judge` bypasses OpenClaw and dispatches directly by model prefix unless
+    `--judge-base-url` is provided, in which case it uses the supplied
+    OpenAI-compatible endpoint.
+    """
+    if not judge_model:
+        return
+
+    backend = _judge_backend_name(judge_model, judge_base_url=judge_base_url)
+    logger.info("Direct judge backend: %s (%s)", backend, judge_model)
+
+    if judge_base_url:
+        resolved_api_key = _resolve_custom_judge_api_key(judge_base_url, judge_api_key)
+        if not resolved_api_key:
+            raise ModelValidationError(
+                "Custom judge endpoint requires an API key. Set --judge-api-key, "
+                "$JUDGE_API_KEY, $AZURE_OPENAI_API_KEY, or $OPENAI_API_KEY."
+            )
+        return
+
+    if backend == "claude_cli":
+        if shutil.which("claude") is None:
+            raise ModelValidationError(
+                "Judge backend 'claude' requires the Claude CLI to be installed and available in PATH."
+            )
+        return
+
+    if backend == "anthropic":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            hint = (
+                f" If you meant to route through OpenRouter, use 'openrouter/{judge_model}'."
+            )
+            raise ModelValidationError(
+                f"Judge model '{judge_model}' routes to the native Anthropic API, but ANTHROPIC_API_KEY is not set.{hint}"
+            )
+        return
+
+    if backend == "openai":
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise ModelValidationError(
+                f"Judge model '{judge_model}' routes to the OpenAI API, but OPENAI_API_KEY is not set."
+            )
+        return
+
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        raise ModelValidationError(
+            f"Judge model '{judge_model}' routes to OpenRouter, but OPENROUTER_API_KEY is not set."
+        )
+    validate_openrouter_model(judge_model)
+
+
+
 def main():
     """Main entry point for the benchmark script."""
     # Determine tasks directory
@@ -803,14 +901,23 @@ def main():
     agent_workspace = Path(f"/tmp/pinchbench/{run_id}/agent_workspace")
 
     # Validate model exists before wasting time on tasks
-    if args.base_url:
-        logger.info("Using custom endpoint: %s (skipping OpenRouter validation)", args.base_url)
-    else:
-        try:
+    try:
+        if args.base_url:
+            logger.info(
+                "Using custom endpoint for benchmarked agent: %s (skipping OpenRouter validation)",
+                args.base_url,
+            )
+        else:
             validate_openrouter_model(args.model)
-        except ModelValidationError as exc:
-            logger.error("❌ %s", exc)
-            sys.exit(1)
+
+        _validate_direct_judge_configuration(
+            args.judge,
+            judge_base_url=args.judge_base_url,
+            judge_api_key=args.judge_api_key,
+        )
+    except ModelValidationError as exc:
+        logger.error("❌ %s", exc)
+        sys.exit(1)
 
     ensure_agent_exists(
         agent_id,
@@ -1055,6 +1162,8 @@ def main():
             if args.judge:
                 grade_kwargs["judge_model"] = args.judge
                 grade_kwargs["judge_backend"] = "api"
+                grade_kwargs["judge_base_url"] = args.judge_base_url
+                grade_kwargs["judge_api_key"] = args.judge_api_key
 
             # Parallel grading: submit to background if enabled and single run
             # For multi-run tasks, grade synchronously to maintain order
