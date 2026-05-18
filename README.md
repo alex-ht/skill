@@ -95,6 +95,10 @@ export PINCHBENCH_OFFICIAL_KEY=your_official_key
 | ------------------------ | ----------------------------------------------------------------------------- |
 | `--model MODEL`          | Model to test (e.g., `openrouter/anthropic/claude-sonnet-4`)                  |
 | `--judge MODEL`          | Judge model for LLM grading; uses direct API when set (see below)             |
+| `--base-url URL`         | Custom OpenAI-compatible endpoint for the benchmarked agent model             |
+| `--api-key KEY`          | API key for the benchmarked agent custom endpoint                             |
+| `--judge-base-url URL`   | Custom OpenAI-compatible endpoint for the judge model                         |
+| `--judge-api-key KEY`    | API key for the judge custom endpoint                                         |
 | `--suite SUITE`          | `all`, `automated-only`, or comma-separated task IDs                          |
 | `--runs N`               | Number of runs per task for averaging                                         |
 | `--timeout-multiplier N` | Scale timeouts for slower models                                              |
@@ -124,9 +128,22 @@ By default (no `--judge` flag), the LLM judge runs as an OpenClaw agent session.
 
 # Headless Claude CLI
 ./scripts/run.sh --model openai/gpt-4o --judge claude
+
+# Azure OpenAI-compatible endpoint for the judge
+./scripts/run.sh \
+  --model gemma-4-e4b-it \
+  --judge gpt-4.1-mini \
+  --judge-base-url "https://YOUR-RESOURCE.openai.azure.com/openai/v1" \
+  --judge-api-key "$AZURE_OPENAI_API_KEY"
 ```
 
-Required env vars: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` depending on the judge model prefix.
+For custom OpenAI-compatible judge endpoints, `--judge-base-url` may be either:
+- a base URL such as `https://.../openai/v1`
+- or a full `.../chat/completions` endpoint
+
+For Azure-style endpoints, PinchBench automatically uses the `api-key` header. If `--judge-api-key` is omitted, it falls back to `JUDGE_API_KEY`, then `AZURE_OPENAI_API_KEY` for Azure URLs, then `OPENAI_API_KEY`.
+
+Required env vars without `--judge-base-url`: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` depending on the judge model prefix.
 
 ## Contributing Tasks
 
