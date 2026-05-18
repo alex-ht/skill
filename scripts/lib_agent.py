@@ -13,7 +13,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib import error, request
+from urllib import error, parse, request
 
 from lib_tasks import Task
 from lib_fws import is_fws_task, fws_available, start_fws, stop_fws
@@ -479,7 +479,6 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
             dest = workspace / fname
             dest.write_bytes(main_file.read_bytes())
             logger.info("Copied bootstrap file to benchmark workspace: %s", fname)
-
     return workspace
 
 
@@ -496,7 +495,11 @@ def _get_agent_store_dir(agent_id: str) -> Path:
     return direct_dir
 
 
-def _resolve_session_id_from_store(agent_id: str) -> str | None:
+def _resolve_session_id_from_store(
+    agent_id: str,
+    started_at: float = 0.0,
+    tolerance_seconds: float = 5.0,
+) -> str | None:
     agent_dir = _get_agent_store_dir(agent_id)
     sessions_store = agent_dir / "sessions" / "sessions.json"
     if not sessions_store.exists():
@@ -509,6 +512,16 @@ def _resolve_session_id_from_store(agent_id: str) -> str | None:
     if not isinstance(sessions_payload, dict):
         return None
 
+    min_updated_at_ms = None
+    if started_at > 0:
+        min_updated_at_ms = (started_at - tolerance_seconds) * 1000.0
+
+    def _is_recent_entry(entry: dict[str, Any]) -> bool:
+        if min_updated_at_ms is None:
+            return True
+        updated_at = entry.get("updatedAt")
+        return isinstance(updated_at, (int, float)) and updated_at >= min_updated_at_ms
+
     normalized_id = agent_id.replace(":", "-").lower()
     preferred_keys = [
         f"agent:{agent_id}:main",
@@ -518,7 +531,7 @@ def _resolve_session_id_from_store(agent_id: str) -> str | None:
     ]
     for key in preferred_keys:
         entry = sessions_payload.get(key)
-        if isinstance(entry, dict) and entry.get("sessionId"):
+        if isinstance(entry, dict) and entry.get("sessionId") and _is_recent_entry(entry):
             return entry["sessionId"]
 
     newest_entry = None
@@ -526,7 +539,7 @@ def _resolve_session_id_from_store(agent_id: str) -> str | None:
     for entry in sessions_payload.values():
         if not isinstance(entry, dict):
             continue
-        if "sessionId" not in entry:
+        if "sessionId" not in entry or not _is_recent_entry(entry):
             continue
         updated_at = entry.get("updatedAt")
         if isinstance(updated_at, (int, float)) and updated_at > newest_timestamp:
@@ -598,8 +611,9 @@ def _find_recent_session_path(agent_dir: Path, started_at: float) -> Path | None
     recent_candidates = [
         path for path in candidates if path.stat().st_mtime >= (started_at - tolerance_seconds)
     ]
-    pool = recent_candidates or candidates
-    return max(pool, key=lambda path: path.stat().st_mtime)
+    if not recent_candidates:
+        return None
+    return max(recent_candidates, key=lambda path: path.stat().st_mtime)
 
 
 def _load_transcript(
@@ -608,25 +622,49 @@ def _load_transcript(
     agent_dir = _get_agent_store_dir(agent_id)
     transcript_path = None
 
-    # OpenClaw ignores the --session-id we pass and generates its own UUID-based
-    # session ID internally.  We need to discover the actual transcript path.
+    # Some OpenClaw/runtime versions honor the passed --session-id directly,
+    # while others surface a different internal session ID via sessions.json.
+    # Prefer the exact session_id we requested first, because it is the only
+    # task-scoped identifier we control. Fall back to sessions.json / recent-file
+    # discovery only when that exact path is still missing.
     #
     # Strategy (with retries to handle write-delay):
-    #   1. Resolve the real session ID from sessions.json
-    #   2. Glob for any .jsonl in the sessions dir (most-recently-modified)
-    #   3. Try our passed-in session ID as a last resort
+    #   1. Try our passed-in session ID first
+    #   2. Resolve the real session ID from sessions.json
+    #   3. Parse transcript-like paths from sessions.json values
+    #   4. Recent-file fallback restricted to this task start window
+    session_dir = agent_dir / "sessions"
+    min_mtime = started_at - 5.0
     for attempt in range(90):
-        # 1. Try sessions.json first — OpenClaw writes the real UUID here
-        resolved_session_id = _resolve_session_id_from_store(agent_id)
+        # 1. Try our passed-in session ID first.
+        for direct_path in (
+            session_dir / f"{session_id}.jsonl",
+            session_dir / f"{session_id}.ndjson",
+            session_dir / session_id / "transcript.jsonl",
+            session_dir / session_id / "events.jsonl",
+        ):
+            if direct_path.exists() and direct_path.stat().st_mtime >= min_mtime:
+                transcript_path = direct_path
+                logger.info(
+                    "Found transcript via passed session ID: %s (attempt %s)",
+                    direct_path.name,
+                    attempt + 1,
+                )
+                break
+        if transcript_path is not None:
+            break
+
+        # 2. Try sessions.json next — but only trust entries updated for this task,
+        # and only accept transcript files that are also fresh for this task.
+        resolved_session_id = _resolve_session_id_from_store(agent_id, started_at)
         if resolved_session_id:
-            session_dir = agent_dir / "sessions"
             for candidate in (
                 session_dir / f"{resolved_session_id}.jsonl",
                 session_dir / f"{resolved_session_id}.ndjson",
                 session_dir / resolved_session_id / "transcript.jsonl",
                 session_dir / resolved_session_id / "events.jsonl",
             ):
-                if candidate.exists():
+                if candidate.exists() and candidate.stat().st_mtime >= min_mtime:
                     transcript_path = candidate
                     logger.info(
                         "Found transcript via sessions.json: %s (attempt %s)",
@@ -638,7 +676,7 @@ def _load_transcript(
             if transcript_path is not None:
                 break
 
-        # 1b. Parse transcript-like paths from sessions.json values
+        # 3. Parse transcript-like paths from sessions.json values
         candidate_from_store = _find_transcript_path_from_sessions_store(agent_id, started_at)
         if candidate_from_store is not None:
             transcript_path = candidate_from_store
@@ -649,7 +687,7 @@ def _load_transcript(
             )
             break
 
-        # 2. Glob fallback — pick the most recently modified .jsonl
+        # 4. Glob fallback — only consider transcripts written for this task window.
         recent_path = _find_recent_session_path(agent_dir, started_at)
         if recent_path is not None:
             transcript_path = recent_path
@@ -658,22 +696,6 @@ def _load_transcript(
                 recent_path.name,
                 attempt + 1,
             )
-            break
-
-        # 3. Try our passed-in session ID (unlikely to work, but check anyway)
-        for direct_path in (
-            agent_dir / "sessions" / f"{session_id}.jsonl",
-            agent_dir / "sessions" / f"{session_id}.ndjson",
-        ):
-            if direct_path.exists():
-                transcript_path = direct_path
-                logger.info(
-                    "Found transcript via passed session ID: %s (attempt %s)",
-                    direct_path.name,
-                    attempt + 1,
-                )
-                break
-        if transcript_path is not None:
             break
 
         if attempt < 89:
@@ -1183,22 +1205,66 @@ _JUDGE_SYSTEM_MSG = (
 )
 
 
+def _normalize_openai_compat_endpoint(base_url: str) -> str:
+    """Normalize a custom OpenAI-compatible endpoint to /chat/completions.
+
+    Accepts either a full endpoint URL or a base URL such as:
+      - https://host/v1
+      - https://host/openai/v1
+      - https://host/openai/deployments/<deployment>?api-version=...
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        raise ValueError("base_url is required")
+
+    parsed = parse.urlsplit(raw)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/chat/completions"):
+        final_path = path
+    else:
+        final_path = f"{path}/chat/completions"
+    return parse.urlunsplit((parsed.scheme, parsed.netloc, final_path, parsed.query, parsed.fragment))
+
+
+def _resolve_custom_judge_api_key(base_url: str, api_key: Optional[str]) -> Optional[str]:
+    if api_key:
+        return api_key
+    env_key = os.environ.get("JUDGE_API_KEY")
+    if env_key:
+        return env_key
+    lowered = base_url.lower()
+    if ".openai.azure.com" in lowered or "azure.com" in lowered:
+        return os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    return os.environ.get("OPENAI_API_KEY")
+
+
+def _openai_compat_auth_headers(endpoint: str, api_key: str) -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    lowered = endpoint.lower()
+    if ".openai.azure.com" in lowered or "azure.com" in lowered:
+        headers["api-key"] = api_key
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 def call_judge_api(
     *,
     prompt: str,
     model: str,
     timeout_seconds: float = 120.0,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Call a judge model directly via API, bypassing OpenClaw.
 
-    Dispatches based on model prefix:
-      - openrouter/* -> OpenRouter chat completions API
-      - anthropic/*  -> Anthropic Messages API
-      - openai/*     -> OpenAI chat completions API
-      - claude       -> headless Claude CLI (claude -p)
+    Dispatches based on model prefix unless ``base_url`` is supplied, in which
+    case the judge is sent to that custom OpenAI-compatible endpoint.
 
     Returns {"status": str, "text": str, "error"?: str}.
     """
+    if base_url:
+        return _judge_via_custom_openai_compat(prompt, model, base_url, api_key, timeout_seconds)
     if model == "claude" or model.startswith("claude:"):
         return _judge_via_claude_cli(prompt, model, timeout_seconds)
     if model.startswith("anthropic/"):
@@ -1228,12 +1294,11 @@ def _judge_via_openai_compat(
         "max_completion_tokens": 2048,
     }).encode("utf-8")
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
     if extra_headers:
         headers.update(extra_headers)
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     req = request.Request(endpoint, data=payload, headers=headers, method="POST")
     try:
@@ -1256,8 +1321,38 @@ def _judge_via_openai_compat(
     choices = data.get("choices", [])
     if not choices:
         return {"status": "error", "text": "", "error": "No choices in response"}
-    text = choices[0].get("message", {}).get("content", "")
+    text = choices[0].get("message", {}).get("content") or ""
     return {"status": "success", "text": text}
+
+
+def _judge_via_custom_openai_compat(
+    prompt: str,
+    model: str,
+    base_url: str,
+    api_key: Optional[str],
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    resolved_api_key = _resolve_custom_judge_api_key(base_url, api_key)
+    if not resolved_api_key:
+        return {
+            "status": "error",
+            "text": "",
+            "error": (
+                "Custom judge endpoint requires an API key. Set JUDGE_API_KEY, "
+                "AZURE_OPENAI_API_KEY, OPENAI_API_KEY, or pass --judge-api-key."
+            ),
+        }
+
+    endpoint = _normalize_openai_compat_endpoint(base_url)
+    api_model = model.removeprefix("openai/").removeprefix("openrouter/")
+    return _judge_via_openai_compat(
+        prompt,
+        api_model,
+        endpoint,
+        resolved_api_key,
+        timeout_seconds,
+        extra_headers=_openai_compat_auth_headers(endpoint, resolved_api_key),
+    )
 
 
 def _judge_via_openrouter(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:

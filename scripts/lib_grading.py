@@ -120,6 +120,8 @@ def grade_task(
     judge_agent_prefix: str = DEFAULT_JUDGE_AGENT_PREFIX,
     judge_timeout_seconds: float = DEFAULT_JUDGE_TIMEOUT_SECONDS,
     judge_backend: str = "api",
+    judge_base_url: Optional[str] = None,
+    judge_api_key: Optional[str] = None,
     verbose: bool = False,
 ) -> GradeResult:
     grading_type = task.grading_type
@@ -140,6 +142,8 @@ def grade_task(
             judge_agent_prefix=judge_agent_prefix,
             judge_timeout_seconds=judge_timeout_seconds,
             judge_backend=judge_backend,
+            judge_base_url=judge_base_url,
+            judge_api_key=judge_api_key,
             skill_dir=skill_dir,
             verbose=verbose,
         )
@@ -155,6 +159,8 @@ def grade_task(
             judge_agent_prefix=judge_agent_prefix,
             judge_timeout_seconds=judge_timeout_seconds,
             judge_backend=judge_backend,
+            judge_base_url=judge_base_url,
+            judge_api_key=judge_api_key,
             skill_dir=skill_dir,
             verbose=verbose,
         )
@@ -252,6 +258,8 @@ def _grade_llm_judge(
     judge_agent_prefix: str,
     judge_timeout_seconds: float,
     judge_backend: str = "api",
+    judge_base_url: Optional[str] = None,
+    judge_api_key: Optional[str] = None,
     skill_dir: Optional[Path] = None,
     verbose: bool = False,
 ) -> GradeResult:
@@ -286,7 +294,7 @@ def _grade_llm_judge(
             workspace_content[:500],
         )
     rubric = task.llm_judge_rubric or _format_grading_criteria(task)
-    
+
     # Check cache before calling judge
     cache_key = _compute_cache_key(task.task_id, transcript_summary, rubric, judge_model)
     if cache_key in _judge_cache:
@@ -305,7 +313,7 @@ def _grade_llm_judge(
     get_judge_cache_stats._misses = getattr(get_judge_cache_stats, "_misses", 0) + 1
     if verbose:
         logger.info("   [VERBOSE] Cache MISS for %s (key=%s)", task.task_id, cache_key[:8])
-    
+
     prompt = _build_judge_prompt(task, transcript_summary, rubric, workspace_content)
 
     max_judge_attempts = 2
@@ -317,6 +325,8 @@ def _grade_llm_judge(
                 prompt=prompt,
                 model=judge_model,
                 timeout_seconds=judge_timeout_seconds,
+                base_url=judge_base_url,
+                api_key=judge_api_key,
             )
 
             if verbose:
@@ -390,7 +400,7 @@ def _grade_llm_judge(
             task.task_id,
             raw_parsed,
         )
-    
+
     result = GradeResult(
         task_id=task.task_id,
         score=float(total) if total is not None else 0.0,
@@ -399,7 +409,7 @@ def _grade_llm_judge(
         breakdown=_normalize_score_dict(breakdown),
         notes=str(notes) if notes is not None else "",
     )
-    
+
     # Cache successful results (only if we got a valid score)
     if total is not None:
         _judge_cache[cache_key] = {
@@ -409,7 +419,7 @@ def _grade_llm_judge(
             "notes": result.notes,
         }
         _save_judge_cache()
-    
+
     return result
 
 
@@ -522,6 +532,8 @@ def _read_workspace_files(workspace_path: str) -> str:
         "AGENTS.md",
     }
     skip_dirs = {".git", ".openclaw", "__pycache__", "node_modules", "skills"}
+    max_chars = 4000
+    head_tail_chars = 2000
     file_contents: List[str] = []
     for f in sorted(workspace.rglob("*")):
         if not f.is_file():
@@ -534,6 +546,12 @@ def _read_workspace_files(workspace_path: str) -> str:
             continue
         try:
             content = f.read_text(encoding="utf-8")
+            if len(content) > max_chars:
+                content = (
+                    f"{content[:head_tail_chars]}"
+                    "\n\n... [truncated, showing first 2000 and last 2000 characters] ...\n\n"
+                    f"{content[-head_tail_chars:]}"
+                )
             file_contents.append(f"### File: {rel}\n{content}")
         except (OSError, UnicodeDecodeError):
             pass
