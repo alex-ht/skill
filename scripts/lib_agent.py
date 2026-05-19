@@ -774,6 +774,7 @@ def _archive_transcript(
     start_time: float,
     output_dir: Optional[Path],
     task_id: str,
+    run_id: str,
     session_index: int,
 ) -> None:
     """Archive the transcript for a session before starting a new one.
@@ -787,7 +788,7 @@ def _archive_transcript(
     if transcript_path and output_dir:
         import shutil as _shutil
         output_dir.mkdir(parents=True, exist_ok=True)
-        archive_dest = output_dir / f"{task_id}_session{session_index}.jsonl"
+        archive_dest = output_dir / f"{run_id}_session{session_index}.jsonl"
         try:
             _shutil.copy2(transcript_path, archive_dest)
             logger.info("Archived session %d transcript to %s", session_index, archive_dest)
@@ -872,6 +873,7 @@ def execute_openclaw_task(
                     start_time=start_time,
                     output_dir=output_dir,
                     task_id=task.task_id,
+                    run_id=run_id,
                     session_index=i - 1,
                 )
                 # Clean up old session state so the agent starts with a blank slate
@@ -1001,7 +1003,7 @@ def execute_openclaw_task(
     if transcript_path and output_dir:
         import shutil as _shutil
         output_dir.mkdir(parents=True, exist_ok=True)
-        archive_dest = output_dir / f"{task.task_id}.jsonl"
+        archive_dest = output_dir / f"{run_id}.jsonl"
         try:
             _shutil.copy2(transcript_path, archive_dest)
             logger.info("Archived transcript to %s", archive_dest)
@@ -1226,12 +1228,38 @@ def _normalize_openai_compat_endpoint(base_url: str) -> str:
     return parse.urlunsplit((parsed.scheme, parsed.netloc, final_path, parsed.query, parsed.fragment))
 
 
-def _resolve_custom_judge_api_key(base_url: str, api_key: Optional[str]) -> Optional[str]:
+def _normalize_anthropic_compat_endpoint(base_url: str) -> str:
+    """Normalize a custom Anthropic-compatible endpoint to /messages.
+
+    Accepts either a full endpoint URL or a base URL such as:
+      - https://host/v1
+      - https://host/anthropic/v1
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        raise ValueError("base_url is required")
+
+    parsed = parse.urlsplit(raw)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/messages"):
+        final_path = path
+    else:
+        final_path = f"{path}/messages"
+    return parse.urlunsplit((parsed.scheme, parsed.netloc, final_path, parsed.query, parsed.fragment))
+
+
+def _resolve_custom_judge_api_key(
+    base_url: str,
+    api_key: Optional[str],
+    api_format: str = "openai",
+) -> Optional[str]:
     if api_key:
         return api_key
     env_key = os.environ.get("JUDGE_API_KEY")
     if env_key:
         return env_key
+    if api_format == "anthropic":
+        return os.environ.get("ANTHROPIC_API_KEY")
     lowered = base_url.lower()
     if ".openai.azure.com" in lowered or "azure.com" in lowered:
         return os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -1255,15 +1283,19 @@ def call_judge_api(
     timeout_seconds: float = 120.0,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    api_format: str = "openai",
 ) -> Dict[str, Any]:
     """Call a judge model directly via API, bypassing OpenClaw.
 
     Dispatches based on model prefix unless ``base_url`` is supplied, in which
-    case the judge is sent to that custom OpenAI-compatible endpoint.
+    case the judge is sent to that custom endpoint using the selected
+    ``api_format`` protocol.
 
     Returns {"status": str, "text": str, "error"?: str}.
     """
     if base_url:
+        if api_format == "anthropic":
+            return _judge_via_custom_anthropic_compat(prompt, model, base_url, api_key, timeout_seconds)
         return _judge_via_custom_openai_compat(prompt, model, base_url, api_key, timeout_seconds)
     if model == "claude" or model.startswith("claude:"):
         return _judge_via_claude_cli(prompt, model, timeout_seconds)
@@ -1332,7 +1364,7 @@ def _judge_via_custom_openai_compat(
     api_key: Optional[str],
     timeout_seconds: float,
 ) -> Dict[str, Any]:
-    resolved_api_key = _resolve_custom_judge_api_key(base_url, api_key)
+    resolved_api_key = _resolve_custom_judge_api_key(base_url, api_key, api_format="openai")
     if not resolved_api_key:
         return {
             "status": "error",
@@ -1353,6 +1385,61 @@ def _judge_via_custom_openai_compat(
         timeout_seconds,
         extra_headers=_openai_compat_auth_headers(endpoint, resolved_api_key),
     )
+
+
+def _judge_via_custom_anthropic_compat(
+    prompt: str,
+    model: str,
+    base_url: str,
+    api_key: Optional[str],
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    resolved_api_key = _resolve_custom_judge_api_key(base_url, api_key, api_format="anthropic")
+    if not resolved_api_key:
+        return {
+            "status": "error",
+            "text": "",
+            "error": (
+                "Custom Anthropic-compatible judge endpoint requires an API key. "
+                "Set JUDGE_API_KEY, ANTHROPIC_API_KEY, or pass --judge-api-key."
+            ),
+        }
+
+    endpoint = _normalize_anthropic_compat_endpoint(base_url)
+    bare_model = model.removeprefix("anthropic/")
+    payload = json.dumps({
+        "model": bare_model,
+        "max_tokens": 2048,
+        "temperature": 0.0,
+        "system": _JUDGE_SYSTEM_MSG,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    headers = {
+        "x-api-key": resolved_api_key,
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+    }
+    req = request.Request(endpoint, data=payload, headers=headers, method="POST")
+    try:
+        with request.urlopen(req, timeout=timeout_seconds) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        logger.error("Custom Anthropic judge API error (%s): %s", exc.code, body)
+        return {"status": "error", "text": "", "error": f"HTTP {exc.code}: {body}"}
+    except error.URLError as exc:
+        logger.error("Custom Anthropic judge network error: %s", exc)
+        return {"status": "error", "text": "", "error": str(exc)}
+    except TimeoutError:
+        return {"status": "timeout", "text": "", "error": "Request timed out"}
+
+    content = data.get("content", [])
+    text = "".join(block.get("text", "") for block in content if block.get("type") == "text")
+    return {"status": "success", "text": text}
 
 
 def _judge_via_openrouter(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:
