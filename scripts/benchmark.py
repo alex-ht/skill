@@ -257,8 +257,8 @@ def _parse_args() -> argparse.Namespace:
         "--judge-base-url",
         default=None,
         help=(
-            "Custom OpenAI-compatible API base URL for the judge model. "
-            "Accepts either a full /chat/completions endpoint or a base URL like .../v1."
+            "Custom API base URL for the judge model. Use --judge-api-format to select "
+            "OpenAI /chat/completions vs Anthropic /messages compatibility."
         ),
     )
     parser.add_argument(
@@ -266,7 +266,18 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "API key for the judge custom endpoint "
-            "(default: $JUDGE_API_KEY, then $AZURE_OPENAI_API_KEY for Azure URLs, then $OPENAI_API_KEY)"
+            "(default: $JUDGE_API_KEY, then format-specific fallbacks such as "
+            "$ANTHROPIC_API_KEY or $AZURE_OPENAI_API_KEY/$OPENAI_API_KEY)"
+        ),
+    )
+    parser.add_argument(
+        "--judge-api-format",
+        choices=["openai", "anthropic"],
+        default="openai",
+        help=(
+            "Protocol/format for --judge-base-url custom endpoints. "
+            "Use 'anthropic' when the proxy expects Anthropic-style /v1/messages (x-api-key header). "
+            "Default 'openai' for OpenAI /chat/completions compatible."
         ),
     )
     parser.add_argument(
@@ -710,10 +721,9 @@ def _log_category_summary(
 def _snapshot_workspace_for_grading(execution_result: Dict[str, Any]) -> Dict[str, Any]:
     """Snapshot the workspace directory so a background grader reads stable files.
 
-    When parallel grading is enabled, the main thread moves on to the next task
-    and calls ``prepare_task_workspace`` which wipes and rebuilds the shared
-    agent workspace.  If the background grader reads the live workspace it will
-    see the *next* task's files instead of the current one's.
+    When parallel grading is enabled, the main thread may move on and prepare a
+    different workspace for the next execution. If the background grader reads
+    the live workspace it can observe files from the wrong execution.
 
     This function copies the workspace tree into an isolated temp directory and
     returns a shallow copy of *execution_result* whose ``workspace`` key points
@@ -735,8 +745,14 @@ def _snapshot_workspace_for_grading(execution_result: Dict[str, Any]) -> Dict[st
     return snapshot_result
 
 
-def _judge_backend_name(model: str, judge_base_url: Optional[str] = None) -> str:
+def _judge_backend_name(
+    model: str,
+    judge_base_url: Optional[str] = None,
+    judge_api_format: str = "openai",
+) -> str:
     if judge_base_url:
+        if judge_api_format == "anthropic":
+            return "anthropic_compat_custom"
         return "openai_compat_custom"
     if model == "claude" or model.startswith("claude:"):
         return "claude_cli"
@@ -747,11 +763,17 @@ def _judge_backend_name(model: str, judge_base_url: Optional[str] = None) -> str
     return "openrouter"
 
 
-def _resolve_custom_judge_api_key(judge_base_url: str, judge_api_key: Optional[str]) -> Optional[str]:
+def _resolve_custom_judge_api_key(
+    judge_base_url: str,
+    judge_api_key: Optional[str],
+    judge_api_format: str = "openai",
+) -> Optional[str]:
     if judge_api_key:
         return judge_api_key
     if os.environ.get("JUDGE_API_KEY"):
         return os.environ.get("JUDGE_API_KEY")
+    if judge_api_format == "anthropic":
+        return os.environ.get("ANTHROPIC_API_KEY")
     base = judge_base_url.lower()
     if ".openai.azure.com" in base or "azure.com" in base:
         return os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -763,22 +785,36 @@ def _validate_direct_judge_configuration(
     *,
     judge_base_url: Optional[str] = None,
     judge_api_key: Optional[str] = None,
+    judge_api_format: str = "openai",
 ) -> None:
     """Fail fast when a direct judge model would route to the wrong backend.
 
     `--judge` bypasses OpenClaw and dispatches directly by model prefix unless
-    `--judge-base-url` is provided, in which case it uses the supplied
-    OpenAI-compatible endpoint.
+    `--judge-base-url` is provided, in which case it uses the supplied custom
+    endpoint with the selected `--judge-api-format` protocol.
     """
     if not judge_model:
         return
 
-    backend = _judge_backend_name(judge_model, judge_base_url=judge_base_url)
+    backend = _judge_backend_name(
+        judge_model,
+        judge_base_url=judge_base_url,
+        judge_api_format=judge_api_format,
+    )
     logger.info("Direct judge backend: %s (%s)", backend, judge_model)
 
     if judge_base_url:
-        resolved_api_key = _resolve_custom_judge_api_key(judge_base_url, judge_api_key)
+        resolved_api_key = _resolve_custom_judge_api_key(
+            judge_base_url,
+            judge_api_key,
+            judge_api_format=judge_api_format,
+        )
         if not resolved_api_key:
+            if judge_api_format == "anthropic":
+                raise ModelValidationError(
+                    "Custom Anthropic-compatible judge endpoint requires an API key. "
+                    "Set --judge-api-key, $JUDGE_API_KEY, or $ANTHROPIC_API_KEY."
+                )
             raise ModelValidationError(
                 "Custom judge endpoint requires an API key. Set --judge-api-key, "
                 "$JUDGE_API_KEY, $AZURE_OPENAI_API_KEY, or $OPENAI_API_KEY."
@@ -895,10 +931,11 @@ def main():
     model_slug = slugify_model(args.model)
     run_root = Path("/tmp/pinchbench")
     run_id = _next_run_id(run_root)
+    benchmark_run_dir = run_root / run_id
     skill_dir = skill_root
-    agent_id = f"bench-{model_slug}"
-    # Use a shared workspace for the agent - we'll copy fixtures per task
-    agent_workspace = Path(f"/tmp/pinchbench/{run_id}/agent_workspace")
+    # Each task/run gets its own agent ID and workspace so no execution reuses
+    # another run's workspace or local agent state.
+    agent_id_prefix = f"bench-{model_slug}-{run_id}"
 
     # Validate model exists before wasting time on tasks
     try:
@@ -914,19 +951,11 @@ def main():
             args.judge,
             judge_base_url=args.judge_base_url,
             judge_api_key=args.judge_api_key,
+            judge_api_format=args.judge_api_format,
         )
     except ModelValidationError as exc:
         logger.error("❌ %s", exc)
         sys.exit(1)
-
-    ensure_agent_exists(
-        agent_id,
-        args.model,
-        agent_workspace,
-        base_url=args.base_url,
-        api_key=args.api_key,
-    )
-    cleanup_agent_sessions(agent_id)
 
     task_ids = _select_task_ids(runner.tasks, args.suite, runner.task_loader.category_map)
     
@@ -1123,12 +1152,30 @@ def main():
             )
             logger.info("%s", "=" * 80)
             execution_error = None
+            execution_run_id = f"{run_id}-{task.task_id}-run{run_index + 1:03d}"
+            execution_agent_id = (
+                f"{agent_id_prefix}-{task.task_id.replace('_', '-')}-run{run_index + 1:03d}"
+            )
+            execution_workspace = (
+                benchmark_run_dir
+                / "workspaces"
+                / task.task_id
+                / f"run_{run_index + 1:03d}"
+            )
             try:
+                ensure_agent_exists(
+                    execution_agent_id,
+                    args.model,
+                    execution_workspace,
+                    base_url=args.base_url,
+                    api_key=args.api_key,
+                )
+                cleanup_agent_sessions(execution_agent_id)
                 result = execute_openclaw_task(
                     task=task,
-                    agent_id=agent_id,
+                    agent_id=execution_agent_id,
                     model_id=args.model,
-                    run_id=f"{run_id}-{run_index + 1}",
+                    run_id=execution_run_id,
                     timeout_multiplier=args.timeout_multiplier,
                     skill_dir=skill_dir,
                     output_dir=Path(args.output_dir) / f"{run_id}_transcripts",
@@ -1139,12 +1186,12 @@ def main():
                 execution_error = str(exc)
                 logger.warning("Task execution failed for %s, continuing: %s", task.task_id, exc)
                 result = {
-                    "agent_id": agent_id,
+                    "agent_id": execution_agent_id,
                     "task_id": task.task_id,
                     "status": "error",
                     "transcript": [],
                     "usage": {},
-                    "workspace": "",
+                    "workspace": str(execution_workspace),
                     "exit_code": -1,
                     "timed_out": False,
                     "execution_time": 0.0,
@@ -1164,6 +1211,7 @@ def main():
                 grade_kwargs["judge_backend"] = "api"
                 grade_kwargs["judge_base_url"] = args.judge_base_url
                 grade_kwargs["judge_api_key"] = args.judge_api_key
+                grade_kwargs["judge_api_format"] = args.judge_api_format
 
             # Parallel grading: submit to background if enabled and single run
             # For multi-run tasks, grade synchronously to maintain order
