@@ -65,9 +65,17 @@ def _save_judge_cache() -> None:
         logger.warning(f"Failed to save judge cache: {e}")
 
 
-def _compute_cache_key(task_id: str, transcript: str, rubric: str, model: str) -> str:
+def _compute_cache_key(
+    task_id: str,
+    transcript: str,
+    rubric: str,
+    model: str,
+    backend: str = "api",
+    base_url: Optional[str] = None,
+    api_format: str = "openai",
+) -> str:
     """Compute a cache key from grading inputs."""
-    content = f"{task_id}|{transcript}|{rubric}|{model}"
+    content = f"{task_id}|{transcript}|{rubric}|{model}|{backend}|{base_url or ''}|{api_format}"
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
@@ -122,6 +130,7 @@ def grade_task(
     judge_backend: str = "api",
     judge_base_url: Optional[str] = None,
     judge_api_key: Optional[str] = None,
+    judge_api_format: str = "openai",
     verbose: bool = False,
 ) -> GradeResult:
     grading_type = task.grading_type
@@ -144,6 +153,7 @@ def grade_task(
             judge_backend=judge_backend,
             judge_base_url=judge_base_url,
             judge_api_key=judge_api_key,
+            judge_api_format=judge_api_format,
             skill_dir=skill_dir,
             verbose=verbose,
         )
@@ -161,6 +171,7 @@ def grade_task(
             judge_backend=judge_backend,
             judge_base_url=judge_base_url,
             judge_api_key=judge_api_key,
+            judge_api_format=judge_api_format,
             skill_dir=skill_dir,
             verbose=verbose,
         )
@@ -260,6 +271,7 @@ def _grade_llm_judge(
     judge_backend: str = "api",
     judge_base_url: Optional[str] = None,
     judge_api_key: Optional[str] = None,
+    judge_api_format: str = "openai",
     skill_dir: Optional[Path] = None,
     verbose: bool = False,
 ) -> GradeResult:
@@ -296,7 +308,15 @@ def _grade_llm_judge(
     rubric = task.llm_judge_rubric or _format_grading_criteria(task)
 
     # Check cache before calling judge
-    cache_key = _compute_cache_key(task.task_id, transcript_summary, rubric, judge_model)
+    cache_key = _compute_cache_key(
+        task.task_id,
+        transcript_summary,
+        rubric,
+        judge_model,
+        backend=judge_backend,
+        base_url=judge_base_url,
+        api_format=judge_api_format,
+    )
     if cache_key in _judge_cache:
         cached = _judge_cache[cache_key]
         if verbose:
@@ -327,6 +347,7 @@ def _grade_llm_judge(
                 timeout_seconds=judge_timeout_seconds,
                 base_url=judge_base_url,
                 api_key=judge_api_key,
+                api_format=judge_api_format,
             )
 
             if verbose:
