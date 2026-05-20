@@ -208,6 +208,10 @@ def ensure_agent_exists(
     *,
     base_url: str | None = None,
     api_key: str | None = None,
+    training_recorder: Any | None = None,
+    benchmark_run_id: str | None = None,
+    task_id: str | None = None,
+    run_index: int | None = None,
 ) -> bool:
     """Ensure the OpenClaw agent exists with the correct workspace.
 
