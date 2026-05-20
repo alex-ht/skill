@@ -15,8 +15,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib import error, request
 
-from lib_tasks import Task
 from lib_fws import is_fws_task, fws_available, start_fws, stop_fws
+from lib_tasks import Task
+from lib_train_recorder import supports_recording_api
 
 
 logger = logging.getLogger(__name__)
@@ -177,8 +178,6 @@ def _get_agent_workspace(agent_id: str) -> Path | None:
         if list_result.returncode != 0:
             return None
 
-        # Parse the agent list output to find workspace
-        # OpenClaw normalizes colons to dashes and lowercases agent names
         normalized_id = agent_id.replace(":", "-").lower()
         lines = list_result.stdout.split("\n")
         found_agent = False
@@ -188,17 +187,129 @@ def _get_agent_workspace(agent_id: str) -> Path | None:
                 found_agent = True
             elif found_agent and "Workspace:" in line:
                 workspace_str = line.split("Workspace:")[1].strip()
-                # Expand ~ if present
                 if workspace_str.startswith("~/"):
                     workspace_str = str(Path.home() / workspace_str[2:])
                 return Path(workspace_str)
             elif found_agent and line.strip().startswith("-"):
-                # Found next agent, stop looking
                 break
         return None
     except Exception as exc:
         logger.warning("Failed to get agent workspace: %s", exc)
         return None
+
+
+def _openclaw_config_path() -> Path:
+    return Path.home() / ".openclaw" / "openclaw.json"
+
+
+def _load_openclaw_config() -> Dict[str, Any]:
+    path = _openclaw_config_path()
+    if not path.exists():
+        return {}
+    config = json.loads(path.read_text("utf-8-sig"))
+    if not isinstance(config, dict):
+        return {}
+
+    legacy_providers = config.pop("providers", None)
+    if isinstance(legacy_providers, dict) and legacy_providers:
+        models = config.setdefault("models", {})
+        providers = models.setdefault("providers", {})
+        for provider_id, provider_cfg in legacy_providers.items():
+            providers.setdefault(provider_id, provider_cfg)
+
+    return config
+
+
+def _write_openclaw_config(config: Dict[str, Any]) -> None:
+    path = _openclaw_config_path()
+    path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _resolve_model_ref(model_id: str) -> str | None:
+    config = _load_openclaw_config()
+    defaults = config.get("agents", {}).get("defaults", {}).get("models", {})
+    if isinstance(defaults, dict):
+        if model_id in defaults and "/" in model_id:
+            return model_id
+        for full_ref, meta in defaults.items():
+            if full_ref == model_id:
+                return full_ref
+            if isinstance(meta, dict) and meta.get("alias") == model_id:
+                return full_ref
+
+    if "/" in model_id:
+        return model_id
+
+    providers = config.get("models", {}).get("providers", {})
+    matches: List[str] = []
+    for provider_name, provider in providers.items():
+        if not isinstance(provider, dict):
+            continue
+        for model in provider.get("models", []) or []:
+            if isinstance(model, dict) and model.get("id") == model_id:
+                matches.append(f"{provider_name}/{model_id}")
+    if len(matches) == 1:
+        logger.info("Resolved bare model %s to provider %s", model_id, matches[0].split("/", 1)[0])
+        return matches[0]
+    return None
+
+
+def _find_agent_entry(config: Dict[str, Any], agent_id: str) -> Dict[str, Any] | None:
+    normalized_id = agent_id.replace(":", "-").lower()
+    for entry in config.get("agents", {}).get("list", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("id", ""))
+        entry_name = str(entry.get("name", ""))
+        if entry_id == agent_id or entry_name == agent_id:
+            return entry
+        if entry_id.lower() == normalized_id or entry_name.lower() == normalized_id:
+            return entry
+    return None
+
+
+def _configure_recording_provider_for_agent(
+    *,
+    agent_id: str,
+    selected_provider_name: str,
+    selected_provider: Dict[str, Any],
+    model_id: str,
+    proxy_base_url: str,
+    model_alias: str | None = None,
+) -> str:
+    config = _load_openclaw_config()
+    models = config.setdefault("models", {})
+    providers = models.setdefault("providers", {})
+    agents = config.setdefault("agents", {})
+    defaults = agents.setdefault("defaults", {})
+    default_models = defaults.setdefault("models", {})
+    agent_entry = _find_agent_entry(config, agent_id)
+    if agent_entry is None:
+        raise ValueError(f"Agent {agent_id} not found in OpenClaw config")
+
+    recording_provider_id = f"trainrec-{slugify_model(agent_id)}"
+    recording_model_ref = f"{recording_provider_id}/{model_id}"
+    provider_copy = json.loads(json.dumps(selected_provider, ensure_ascii=False))
+    provider_copy["baseUrl"] = proxy_base_url
+    providers[recording_provider_id] = provider_copy
+
+    original_model_ref = f"{selected_provider_name}/{model_id}"
+    copied_meta: Dict[str, Any] = {}
+    if original_model_ref in default_models and isinstance(default_models[original_model_ref], dict):
+        copied_meta = json.loads(json.dumps(default_models[original_model_ref], ensure_ascii=False))
+    if model_alias and not copied_meta.get("alias"):
+        copied_meta["alias"] = model_alias
+    default_models[recording_model_ref] = copied_meta
+    agent_entry["model"] = recording_model_ref
+
+    _write_openclaw_config(config)
+    logger.info(
+        "Configured recording provider %s for agent %s -> %s",
+        recording_provider_id,
+        agent_id,
+        proxy_base_url,
+    )
+    return recording_provider_id
 
 
 def ensure_agent_exists(
@@ -218,14 +329,11 @@ def ensure_agent_exists(
     If the agent already exists but points to a different workspace, it is
     deleted and recreated so that the new workspace takes effect.
 
-    When *base_url* is provided, a custom OpenAI-compatible provider is
-    configured in the agent's ``models.json`` instead of relying on
-    OpenRouter.  *api_key* defaults to ``${OPENAI_API_KEY}`` (resolved by
-    OpenClaw at runtime) if not given.
-
     Returns True if the agent was (re)created.
     """
     workspace_dir.mkdir(parents=True, exist_ok=True)
+    should_create_agent = True
+    agent_recreated = False
 
     try:
         list_result = subprocess.run(
@@ -240,91 +348,91 @@ def ensure_agent_exists(
         return False
 
     if list_result.returncode == 0:
-        # Check for exact agent ID match — avoid substring false positives
-        # (e.g. "bench-foo-4" matching "bench-foo-4-5" in the output).
-        # Output format is "- <agent_id>" or "- <agent_id> (default)" per line.
-        # OpenClaw normalizes colons to dashes in directory/display names, so
-        # also check the normalized form.
         existing_agents = set()
         for line in list_result.stdout.splitlines():
             line = line.strip()
             if line.startswith("- "):
-                # Extract agent name: "- bench-foo-4-5" or "- main (default)"
                 name_part = line[2:].split()[0] if line[2:].strip() else ""
                 if name_part:
                     existing_agents.add(name_part.lower())
         normalized_id = agent_id.replace(":", "-").lower()
         if agent_id.lower() in existing_agents or normalized_id in existing_agents:
-            # Agent exists — check if workspace matches
             current_workspace = _get_agent_workspace(agent_id)
             if (
                 current_workspace is not None
                 and current_workspace.resolve() == workspace_dir.resolve()
             ):
                 logger.info("Agent %s already exists with correct workspace", agent_id)
-                return False
-            # Workspace is stale or unknown — delete and recreate
-            delete_name = normalized_id if normalized_id in existing_agents else agent_id
-            logger.info(
-                "Agent %s exists with stale workspace (%s != %s), recreating",
-                agent_id,
-                current_workspace,
-                workspace_dir,
-            )
-            subprocess.run(
-                ["openclaw", "agents", "delete", delete_name, "--force"],
+                should_create_agent = False
+            else:
+                delete_name = normalized_id if normalized_id in existing_agents else agent_id
+                logger.info(
+                    "Agent %s exists with stale workspace (%s != %s), recreating",
+                    agent_id,
+                    current_workspace,
+                    workspace_dir,
+                )
+                subprocess.run(
+                    ["openclaw", "agents", "delete", delete_name, "--force"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    shell=USE_SHELL,
+                )
+                agent_recreated = True
+
+    if should_create_agent:
+        logger.info("Creating OpenClaw agent %s", agent_id)
+        try:
+            create_result = subprocess.run(
+                [
+                    "openclaw",
+                    "agents",
+                    "add",
+                    agent_id,
+                    "--model",
+                    model_id,
+                    "--workspace",
+                    str(workspace_dir),
+                    "--non-interactive",
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
-            shell=USE_SHELL,
+                shell=USE_SHELL,
             )
+        except FileNotFoundError:
+            logger.error("openclaw CLI not found while creating agent")
+            return False
 
-    logger.info("Creating OpenClaw agent %s", agent_id)
-    try:
-        create_result = subprocess.run(
-            [
-                "openclaw",
-                "agents",
-                "add",
-                agent_id,
-                "--model",
-                model_id,
-                "--workspace",
-                str(workspace_dir),
-                "--non-interactive",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            shell=USE_SHELL,
-        )
-    except FileNotFoundError:
-        logger.error("openclaw CLI not found while creating agent")
-        return False
+        if create_result.returncode != 0:
+            logger.warning(
+                "Agent creation returned %s: %s", create_result.returncode, create_result.stderr
+            )
+        agent_recreated = True
 
-    if create_result.returncode != 0:
-        logger.warning(
-            "Agent creation returned %s: %s", create_result.returncode, create_result.stderr
-        )
-
-    # Configure models.json for the bench agent
     bench_agent_dir = _get_agent_store_dir(agent_id) / "agent"
     bench_agent_dir.mkdir(parents=True, exist_ok=True)
     bench_models = bench_agent_dir / "models.json"
     main_models = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "models.json"
 
-    if base_url:
-        # Custom OpenAI-compatible endpoint — build a provider entry
-        data: dict[str, Any] = {}
-        if main_models.exists():
-            try:
-                data = json.loads(main_models.read_text("utf-8-sig"))
-            except (json.JSONDecodeError, OSError):
-                data = {}
+    data: dict[str, Any] = {}
+    if main_models.exists():
+        try:
+            data = json.loads(main_models.read_text("utf-8-sig"))
+            logger.info("Copied main agent models.json to bench agent %s", agent_id)
+        except (json.JSONDecodeError, OSError):
+            data = {}
 
+    resolved_model_ref = _resolve_model_ref(model_id)
+    if resolved_model_ref and "/" in resolved_model_ref:
+        provider_name, model_name = resolved_model_ref.split("/", 1)
+        data["defaultProvider"] = provider_name
+        data["defaultModel"] = model_name
+    elif base_url:
         key_ref = api_key if api_key else "${OPENAI_API_KEY}"
         providers = data.setdefault("models", {}).setdefault("providers", {})
-        data["models"]["mode"] = "merge"
+        data.setdefault("models", {})["mode"] = "merge"
         providers["custom"] = {
             "baseUrl": base_url,
             "apiKey": key_ref,
@@ -342,36 +450,50 @@ def ensure_agent_exists(
         }
         data["defaultProvider"] = "custom"
         data["defaultModel"] = model_id
-        bench_models.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
-        logger.info(
-            "Configured custom provider (%s) with model %s for agent %s",
-            base_url,
-            model_id,
-            agent_id,
-        )
-    elif main_models.exists():
-        # Standard OpenRouter flow — copy main's models.json and set defaults
-        import shutil as _shutil
-        _shutil.copy2(main_models, bench_models)
-        if "/" in model_id:
-            provider_name, model_name = model_id.split("/", 1)
-            try:
-                raw = bench_models.read_text("utf-8-sig")
-                data = json.loads(raw)
-                data["defaultProvider"] = provider_name
-                data["defaultModel"] = model_name
-                bench_models.write_text(
-                    json.dumps(data, indent=2, ensure_ascii=False), "utf-8"
-                )
-                logger.info(
-                    "Set bench agent default model to %s / %s", provider_name, model_name
-                )
-            except Exception as exc:
-                logger.warning("Failed to set default model in bench models.json: %s", exc)
-        logger.info("Copied main agent models.json to bench agent %s", agent_id)
 
-    # Delete sessions.json so OpenClaw picks up the new defaultProvider/defaultModel
-    # instead of reusing a cached session entry that still points to an old model.
+    bench_models.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
+
+    if (
+        training_recorder is not None
+        and benchmark_run_id
+        and task_id
+        and run_index is not None
+        and resolved_model_ref
+    ):
+        selected_provider_name, selected_model_name = resolved_model_ref.split("/", 1)
+        selected_provider = _load_openclaw_config().get("models", {}).get("providers", {}).get(
+            selected_provider_name
+        )
+        selected_api = selected_provider.get("api") if isinstance(selected_provider, dict) else None
+        if selected_provider and supports_recording_api(selected_api):
+            proxy_base_url = training_recorder.register_execution(
+                benchmark_run_id=benchmark_run_id,
+                task_id=task_id,
+                run_index=run_index,
+                api=selected_api,
+                upstream_base_url=str(selected_provider.get("baseUrl", "")),
+            )
+            _configure_recording_provider_for_agent(
+                agent_id=agent_id,
+                selected_provider_name=selected_provider_name,
+                selected_provider=selected_provider,
+                model_id=selected_model_name,
+                proxy_base_url=proxy_base_url,
+                model_alias=model_id,
+            )
+            logger.info(
+                "Recording benchmarked model calls for %s run %d via %s",
+                task_id,
+                run_index,
+                proxy_base_url,
+            )
+        elif selected_provider:
+            logger.warning(
+                "Training recorder does not support provider API %s for model %s",
+                selected_api,
+                resolved_model_ref,
+            )
+
     bench_sessions_dir = _get_agent_store_dir(agent_id) / "sessions"
     sessions_store = bench_sessions_dir / "sessions.json"
     if sessions_store.exists():
@@ -381,7 +503,7 @@ def ensure_agent_exists(
         except OSError as exc:
             logger.warning("Failed to delete sessions.json: %s", exc)
 
-    return True
+    return agent_recreated
 
 
 def cleanup_agent_sessions(agent_id: str) -> None:
@@ -481,7 +603,6 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
 
 def _get_agent_store_dir(agent_id: str) -> Path:
     base_dir = Path.home() / ".openclaw" / "agents"
-    # OpenClaw normalizes agent IDs to lowercase and replaces colons with dashes
     normalized_id = agent_id.replace(":", "-").lower()
     direct_dir = base_dir / agent_id
     if direct_dir.exists():
@@ -489,6 +610,37 @@ def _get_agent_store_dir(agent_id: str) -> Path:
     normalized_dir = base_dir / normalized_id
     if normalized_dir.exists():
         return normalized_dir
+
+    try:
+        list_result = subprocess.run(
+            ["openclaw", "agents", "list"],
+            capture_output=True,
+            text=True,
+            check=False,
+            shell=USE_SHELL,
+        )
+        if list_result.returncode == 0:
+            lines = list_result.stdout.splitlines()
+            current_name: str | None = None
+            current_dir: Path | None = None
+            for raw_line in lines:
+                line = raw_line.strip()
+                if line.startswith("- "):
+                    current_name = line[2:].split()[0] if line[2:].strip() else None
+                    current_dir = None
+                    continue
+                if current_name and line.startswith("Agent dir:"):
+                    dir_str = line.split(":", 1)[1].strip()
+                    if dir_str.startswith("~/"):
+                        dir_str = str(Path.home() / dir_str[2:])
+                    current_dir = Path(dir_str)
+                if current_name and current_dir is not None:
+                    current_name_norm = current_name.lower()
+                    if current_name_norm == normalized_id or normalized_id.startswith(current_name_norm):
+                        return current_dir
+    except Exception as exc:
+        logger.warning("Failed to resolve agent store dir for %s: %s", agent_id, exc)
+
     return direct_dir
 
 
@@ -748,6 +900,7 @@ def _archive_transcript(
     start_time: float,
     output_dir: Optional[Path],
     task_id: str,
+    run_id: Optional[str] = None,
     session_index: int,
 ) -> None:
     """Archive the transcript for a session before starting a new one.
@@ -761,7 +914,8 @@ def _archive_transcript(
     if transcript_path and output_dir:
         import shutil as _shutil
         output_dir.mkdir(parents=True, exist_ok=True)
-        archive_dest = output_dir / f"{task_id}_session{session_index}.jsonl"
+        archive_prefix = run_id or task_id
+        archive_dest = output_dir / f"{archive_prefix}_session{session_index}.jsonl"
         try:
             _shutil.copy2(transcript_path, archive_dest)
             logger.info("Archived session %d transcript to %s", session_index, archive_dest)
@@ -846,6 +1000,7 @@ def execute_openclaw_task(
                     start_time=start_time,
                     output_dir=output_dir,
                     task_id=task.task_id,
+                    run_id=run_id,
                     session_index=i - 1,
                 )
                 # Clean up old session state so the agent starts with a blank slate
@@ -947,7 +1102,7 @@ def execute_openclaw_task(
         merged_transcript: List[Dict[str, Any]] = []
         if output_dir:
             for session_idx in range(len(sessions)):
-                archive_path = output_dir / f"{task.task_id}_session{session_idx}.jsonl"
+                archive_path = output_dir / f"{run_id}_session{session_idx}.jsonl"
                 if archive_path.exists():
                     try:
                         for line in archive_path.read_text(encoding="utf-8").splitlines():
@@ -975,7 +1130,7 @@ def execute_openclaw_task(
     if transcript_path and output_dir:
         import shutil as _shutil
         output_dir.mkdir(parents=True, exist_ok=True)
-        archive_dest = output_dir / f"{task.task_id}.jsonl"
+        archive_dest = output_dir / f"{run_id}.jsonl"
         try:
             _shutil.copy2(transcript_path, archive_dest)
             logger.info("Archived transcript to %s", archive_dest)
@@ -1184,24 +1339,21 @@ def call_judge_api(
     prompt: str,
     model: str,
     timeout_seconds: float = 120.0,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    api_format: str = "openai",
 ) -> Dict[str, Any]:
-    """Call a judge model directly via API, bypassing OpenClaw.
-
-    Dispatches based on model prefix:
-      - openrouter/* -> OpenRouter chat completions API
-      - anthropic/*  -> Anthropic Messages API
-      - openai/*     -> OpenAI chat completions API
-      - claude       -> headless Claude CLI (claude -p)
-
-    Returns {"status": str, "text": str, "error"?: str}.
-    """
+    """Call a judge model directly via API, bypassing OpenClaw."""
+    if base_url:
+        if api_format == "anthropic":
+            return _judge_via_anthropic_compat(prompt, model, base_url, api_key, timeout_seconds)
+        return _judge_via_openai_compat_custom(prompt, model, base_url, api_key, timeout_seconds)
     if model == "claude" or model.startswith("claude:"):
         return _judge_via_claude_cli(prompt, model, timeout_seconds)
     if model.startswith("anthropic/"):
         return _judge_via_anthropic(prompt, model, timeout_seconds)
     if model.startswith("openai/"):
         return _judge_via_openai(prompt, model, timeout_seconds)
-    # Default: OpenRouter (handles openrouter/ prefix and bare provider/model)
     return _judge_via_openrouter(prompt, model, timeout_seconds)
 
 
@@ -1253,6 +1405,65 @@ def _judge_via_openai_compat(
     if not choices:
         return {"status": "error", "text": "", "error": "No choices in response"}
     text = choices[0].get("message", {}).get("content", "")
+    return {"status": "success", "text": text}
+
+
+def _judge_via_openai_compat_custom(
+    prompt: str,
+    model: str,
+    base_url: str,
+    api_key: str | None,
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    if not api_key:
+        return {"status": "error", "text": "", "error": "Custom judge API key not set"}
+    endpoint = base_url.rstrip("/") + "/chat/completions"
+    return _judge_via_openai_compat(prompt, model, endpoint, api_key, timeout_seconds)
+
+
+def _judge_via_anthropic_compat(
+    prompt: str,
+    model: str,
+    base_url: str,
+    api_key: str | None,
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    if not api_key:
+        return {"status": "error", "text": "", "error": "Custom judge API key not set"}
+    bare_model = model.removeprefix("anthropic/")
+    payload = json.dumps({
+        "model": bare_model,
+        "max_tokens": 2048,
+        "temperature": 0.0,
+        "system": _JUDGE_SYSTEM_MSG,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+    }
+    endpoint = base_url.rstrip("/") + "/messages"
+    req = request.Request(endpoint, data=payload, headers=headers, method="POST")
+    try:
+        with request.urlopen(req, timeout=timeout_seconds) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        logger.error("Anthropic-compatible judge API error (%s): %s", exc.code, body)
+        return {"status": "error", "text": "", "error": f"HTTP {exc.code}: {body}"}
+    except error.URLError as exc:
+        logger.error("Anthropic-compatible judge network error: %s", exc)
+        return {"status": "error", "text": "", "error": str(exc)}
+    except TimeoutError:
+        return {"status": "timeout", "text": "", "error": "Request timed out"}
+
+    content = data.get("content", [])
+    text = "".join(block.get("text", "") for block in content if block.get("type") == "text")
     return {"status": "success", "text": text}
 
 
