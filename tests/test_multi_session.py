@@ -13,7 +13,7 @@ SCRIPTS_DIR = ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from lib_agent import _archive_transcript  # noqa: E402
+from lib_agent import _archive_transcript, _get_agent_store_dir  # noqa: E402
 from lib_tasks import Task  # noqa: E402
 
 
@@ -191,6 +191,53 @@ class TestArchiveTranscript(unittest.TestCase):
                 task_id="task_test",
                 session_index=0,
             )
+
+
+class TestAgentStoreResolution(unittest.TestCase):
+    @patch("lib_agent.Path.home")
+    @patch("lib_agent.subprocess.run")
+    def test_get_agent_store_dir_prefers_exact_alias_match_and_returns_store_root(
+        self,
+        mock_run: MagicMock,
+        mock_home: MagicMock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            mock_home.return_value = home
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="""Agents:\n- bench-gemma-4-e4b-it\n  Workspace: /tmp/pinchbench/0003/agent_workspace\n  Agent dir: ~/.openclaw/agents/bench-gemma-4-e4b-it/agent\n  Model: gemma-4-e4b-it\n  Routing rules: 0\n- bench-gemma-4-e4b-it-runpod-0003-task-log-hdfs-connections-run00 (bench-gemma-4-e4b-it-runpod-0003-task-log-hdfs-connections-run001)\n  Workspace: /tmp/pinchbench/0003/workspaces/task_log_hdfs_connections/run_001\n  Agent dir: ~/.openclaw/agents/bench-gemma-4-e4b-it-runpod-0003-task-log-hdfs-connections-run00/agent\n  Model: gemma-4-E4B-it-runpod\n  Routing rules: 0\n""",
+                stderr="",
+            )
+
+            resolved = _get_agent_store_dir(
+                "bench-gemma-4-e4b-it-runpod-0003-task-log-hdfs-connections-run001"
+            )
+
+            self.assertEqual(
+                resolved,
+                home / ".openclaw" / "agents" / "bench-gemma-4-e4b-it-runpod-0003-task-log-hdfs-connections-run00",
+            )
+
+    @patch("lib_agent.Path.home")
+    @patch("lib_agent.subprocess.run")
+    def test_get_agent_store_dir_uses_exact_name_without_agent_suffix(
+        self,
+        mock_run: MagicMock,
+        mock_home: MagicMock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            mock_home.return_value = home
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="""Agents:\n- demo-agent\n  Workspace: /tmp/demo\n  Agent dir: ~/.openclaw/agents/demo-agent/agent\n  Model: demo\n  Routing rules: 0\n""",
+                stderr="",
+            )
+
+            resolved = _get_agent_store_dir("demo-agent")
+
+            self.assertEqual(resolved, home / ".openclaw" / "agents" / "demo-agent")
 
 
 class TestMultiSessionTaskLoading(unittest.TestCase):

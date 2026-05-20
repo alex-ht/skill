@@ -638,23 +638,31 @@ def _get_agent_store_dir(agent_id: str) -> Path:
         )
         if list_result.returncode == 0:
             lines = list_result.stdout.splitlines()
-            current_name: str | None = None
+            current_names: list[str] = []
             current_dir: Path | None = None
             for raw_line in lines:
                 line = raw_line.strip()
                 if line.startswith("- "):
-                    current_name = line[2:].split()[0] if line[2:].strip() else None
                     current_dir = None
+                    current_names = []
+                    entry = line[2:].strip()
+                    if entry:
+                        display_name = entry.split()[0]
+                        current_names.append(display_name)
+                        if "(" in entry and entry.endswith(")"):
+                            alias = entry.rsplit("(", 1)[1][:-1].strip()
+                            if alias:
+                                current_names.append(alias)
                     continue
-                if current_name and line.startswith("Agent dir:"):
+                if current_names and line.startswith("Agent dir:"):
                     dir_str = line.split(":", 1)[1].strip()
                     if dir_str.startswith("~/"):
                         dir_str = str(Path.home() / dir_str[2:])
                     current_dir = Path(dir_str)
-                if current_name and current_dir is not None:
-                    current_name_norm = current_name.lower()
-                    if current_name_norm == normalized_id or normalized_id.startswith(current_name_norm):
-                        return current_dir
+                if current_names and current_dir is not None:
+                    normalized_names = {name.replace(":", "-").lower() for name in current_names}
+                    if normalized_id in normalized_names:
+                        return current_dir.parent if current_dir.name == "agent" else current_dir
     except Exception as exc:
         logger.warning("Failed to resolve agent store dir for %s: %s", agent_id, exc)
 

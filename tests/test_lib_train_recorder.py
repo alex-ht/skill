@@ -17,6 +17,7 @@ from lib_train_recorder import (  # noqa: E402
     extract_transcript_assistant_messages,
     normalize_anthropic_request_body,
     normalize_openai_request_body,
+    normalize_openai_responses_request_body,
     supports_recording_api,
 )
 
@@ -24,8 +25,8 @@ from lib_train_recorder import (  # noqa: E402
 class TrainRecorderNormalizationTests(unittest.TestCase):
     def test_supports_recording_api(self) -> None:
         self.assertTrue(supports_recording_api("openai-completions"))
+        self.assertTrue(supports_recording_api("openai-responses"))
         self.assertTrue(supports_recording_api("anthropic-messages"))
-        self.assertFalse(supports_recording_api("openai-responses"))
         self.assertFalse(supports_recording_api(None))
 
     def test_normalize_openai_request_body_preserves_tool_arguments_as_string(self) -> None:
@@ -97,6 +98,60 @@ class TrainRecorderNormalizationTests(unittest.TestCase):
         self.assertEqual(messages[3], {"role": "tool", "tool_call_id": "toolu_1", "content": "ok"})
         self.assertEqual(messages[4], {"role": "user", "content": "continue"})
         self.assertEqual(tools, [{"name": "grep_logs", "input_schema": {"type": "object"}}])
+
+    def test_normalize_openai_responses_request_body_maps_instructions_tools_and_tool_outputs(self) -> None:
+        messages, tools = normalize_openai_responses_request_body(
+            {
+                "instructions": "Finish with QED.",
+                "input": [
+                    {"role": "user", "content": "What is 5 * 3?"},
+                    {
+                        "type": "function_call",
+                        "call_id": "fc_123",
+                        "name": "get_weather",
+                        "arguments": {"city": "Taipei"},
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "fc_123",
+                        "output": "Sunny",
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "15. QED."}],
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(messages[0], {"role": "system", "content": "Finish with QED."})
+        self.assertEqual(messages[1], {"role": "user", "content": "What is 5 * 3?"})
+        self.assertEqual(messages[2]["role"], "assistant")
+        self.assertEqual(messages[2]["content"], "")
+        self.assertEqual(messages[2]["tool_calls"][0]["id"], "fc_123")
+        self.assertEqual(messages[2]["tool_calls"][0]["function"]["name"], "get_weather")
+        self.assertEqual(messages[2]["tool_calls"][0]["function"]["arguments"], '{"city":"Taipei"}')
+        self.assertEqual(messages[3], {"role": "tool", "tool_call_id": "fc_123", "content": "Sunny"})
+        self.assertEqual(messages[4], {"role": "assistant", "content": "15. QED."})
+        self.assertEqual(tools, [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}])
+
+    def test_normalize_openai_responses_request_body_accepts_string_input(self) -> None:
+        messages, tools = normalize_openai_responses_request_body(
+            {
+                "input": "What is 13 * 24?",
+            }
+        )
+
+        self.assertEqual(messages, [{"role": "user", "content": "What is 13 * 24?"}])
+        self.assertIsNone(tools)
 
     def test_extract_transcript_assistant_messages_normalizes_tool_calls(self) -> None:
         transcript = [

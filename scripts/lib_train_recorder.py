@@ -25,7 +25,7 @@ from urllib import parse
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_RECORDING_APIS = {"openai-completions", "anthropic-messages"}
+SUPPORTED_RECORDING_APIS = {"openai-completions", "openai-responses", "anthropic-messages"}
 
 
 @dataclass(frozen=True)
@@ -95,6 +95,96 @@ def _normalize_openai_message(message: Dict[str, Any]) -> Dict[str, Any]:
 
 def normalize_openai_request_body(body: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
     messages = [_normalize_openai_message(message) for message in body.get("messages", [])]
+    return messages, _normalize_tool_schema(body.get("tools"))
+
+
+def _normalize_openai_responses_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return _json_clone(content)
+
+    text_parts: List[str] = []
+    passthrough_blocks: List[Any] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") in {"input_text", "output_text", "text"}:
+            text_parts.append(block.get("text", ""))
+        else:
+            passthrough_blocks.append(_json_clone(block))
+
+    if passthrough_blocks:
+        combined_blocks: List[Any] = []
+        if text_parts:
+            combined_blocks.append({"type": "text", "text": "".join(text_parts)})
+        combined_blocks.extend(passthrough_blocks)
+        return combined_blocks
+    return "".join(text_parts)
+
+
+def _append_openai_responses_input_item(messages: List[Dict[str, Any]], item: Any) -> None:
+    if isinstance(item, str):
+        messages.append({"role": "user", "content": item})
+        return
+    if not isinstance(item, dict):
+        messages.append({"role": "user", "content": _json_clone(item)})
+        return
+
+    item_type = item.get("type")
+    if item_type == "function_call":
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": item.get("call_id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": _stringify_tool_arguments(item.get("arguments")),
+                        },
+                    }
+                ],
+            }
+        )
+        return
+    if item_type == "function_call_output":
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": item.get("call_id", ""),
+                "content": _json_clone(item.get("output", "")),
+            }
+        )
+        return
+
+    if item_type == "message" or "role" in item:
+        normalized: Dict[str, Any] = {
+            "role": str(item.get("role", "user")),
+            "content": _normalize_openai_responses_content(item.get("content", "")),
+        }
+        if "name" in item:
+            normalized["name"] = item["name"]
+        messages.append(normalized)
+        return
+
+    messages.append({"role": "user", "content": _json_clone(item)})
+
+
+def normalize_openai_responses_request_body(body: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
+    messages: List[Dict[str, Any]] = []
+
+    instructions = body.get("instructions")
+    if instructions not in (None, "", []):
+        messages.append({"role": "system", "content": _json_clone(instructions)})
+
+    input_payload = body.get("input", [])
+    if isinstance(input_payload, list):
+        for item in input_payload:
+            _append_openai_responses_input_item(messages, item)
+    else:
+        _append_openai_responses_input_item(messages, input_payload)
+
     return messages, _normalize_tool_schema(body.get("tools"))
 
 
@@ -207,6 +297,8 @@ def normalize_request_capture(api: str, body_bytes: bytes) -> Optional[Dict[str,
 
     if api == "openai-completions":
         messages, tools = normalize_openai_request_body(body)
+    elif api == "openai-responses":
+        messages, tools = normalize_openai_responses_request_body(body)
     elif api == "anthropic-messages":
         messages, tools = normalize_anthropic_request_body(body)
     else:
