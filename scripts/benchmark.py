@@ -13,6 +13,7 @@ from the tasks/ directory.
 # ///
 
 import argparse
+import atexit
 import importlib.metadata
 import json
 import logging
@@ -48,6 +49,7 @@ from lib_grading import (
     clear_judge_cache,
 )
 from lib_tasks import Task, TaskLoader
+from lib_train_recorder import TrainingRecorder
 
 
 # Configure logging
@@ -246,7 +248,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--base-url",
         default=None,
-        help="Custom OpenAI-compatible API base URL for the benchmarked agent model (bypasses OpenRouter validation)",
+        help="Custom OpenAI-compatible API base URL for the benchmarked agent model",
     )
     parser.add_argument(
         "--api-key",
@@ -335,6 +337,14 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=-0.5,
         help="Slope (%%/run) below which regression is flagged (default: -0.5)",
+    )
+    parser.add_argument(
+        "--record-train",
+        action="store_true",
+        help=(
+            "Record successful benchmarked-model calls as training JSONL rows. "
+            "Writes results/{run_id}_train.jsonl with task_id, run_index, messages, and optional tools."
+        ),
     )
     args = parser.parse_args()
 
@@ -937,15 +947,14 @@ def main():
     # another run's workspace or local agent state.
     agent_id_prefix = f"bench-{model_slug}-{run_id}"
 
-    # Validate model exists before wasting time on tasks
+    # The benchmarked model is passed through as-is so local/custom model IDs
+    # can run without OpenRouter catalog validation. Judge models still validate
+    # when they route directly by provider prefix.
     try:
         if args.base_url:
-            logger.info(
-                "Using custom endpoint for benchmarked agent: %s (skipping OpenRouter validation)",
-                args.base_url,
-            )
+            logger.info("Using custom endpoint for benchmarked agent: %s", args.base_url)
         else:
-            validate_openrouter_model(args.model)
+            logger.info("Skipping benchmarked model validation for: %s", args.model)
 
         _validate_direct_judge_configuration(
             args.judge,
@@ -993,6 +1002,14 @@ def main():
     incremental_dir = Path(args.output_dir)
     incremental_dir.mkdir(parents=True, exist_ok=True)
     incremental_path = incremental_dir / f"{run_id}_{model_slug}.json"
+
+    training_recorder: Optional[TrainingRecorder] = None
+    if args.record_train:
+        training_output_path = incremental_dir / f"{run_id}_train.jsonl"
+        training_recorder = TrainingRecorder(training_output_path)
+        training_recorder.start()
+        atexit.register(training_recorder.stop)
+        logger.info("Training JSONL recording enabled: %s", training_output_path)
 
     category_map = runner.task_loader.category_map
     category_order = runner.task_loader.categories
@@ -1162,6 +1179,19 @@ def main():
                 / task.task_id
                 / f"run_{run_index + 1:03d}"
             )
+            result = {
+                "agent_id": execution_agent_id,
+                "task_id": task.task_id,
+                "status": "error",
+                "transcript": [],
+                "usage": {},
+                "workspace": str(execution_workspace),
+                "exit_code": -1,
+                "timed_out": False,
+                "execution_time": 0.0,
+                "stdout": "",
+                "stderr": "",
+            }
             try:
                 ensure_agent_exists(
                     execution_agent_id,
@@ -1169,6 +1199,10 @@ def main():
                     execution_workspace,
                     base_url=args.base_url,
                     api_key=args.api_key,
+                    training_recorder=training_recorder,
+                    benchmark_run_id=run_id if training_recorder is not None else None,
+                    task_id=task.task_id if training_recorder is not None else None,
+                    run_index=run_index + 1 if training_recorder is not None else None,
                 )
                 cleanup_agent_sessions(execution_agent_id)
                 result = execute_openclaw_task(
@@ -1185,19 +1219,30 @@ def main():
             except Exception as exc:
                 execution_error = str(exc)
                 logger.warning("Task execution failed for %s, continuing: %s", task.task_id, exc)
-                result = {
-                    "agent_id": execution_agent_id,
-                    "task_id": task.task_id,
-                    "status": "error",
-                    "transcript": [],
-                    "usage": {},
-                    "workspace": str(execution_workspace),
-                    "exit_code": -1,
-                    "timed_out": False,
-                    "execution_time": 0.0,
-                    "stdout": "",
-                    "stderr": execution_error,
-                }
+                result["stderr"] = execution_error
+            finally:
+                if training_recorder is not None:
+                    try:
+                        rows_written = training_recorder.finalize_execution(
+                            benchmark_run_id=run_id,
+                            task_id=task.task_id,
+                            run_index=run_index + 1,
+                            transcript=result.get("transcript", []),
+                        )
+                        if rows_written:
+                            logger.info(
+                                "Recorded %d training sample(s) for %s run %d",
+                                rows_written,
+                                task.task_id,
+                                run_index + 1,
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "Training recorder finalization failed for %s run %d: %s",
+                            task.task_id,
+                            run_index + 1,
+                            exc,
+                        )
 
             task_results.append(result)
             results.append(result)
@@ -1452,6 +1497,9 @@ def main():
         submission_id=submission_id,
         leaderboard_url=leaderboard_url,
     )
+
+    if training_recorder is not None:
+        training_recorder.stop()
 
 
 if __name__ == "__main__":
