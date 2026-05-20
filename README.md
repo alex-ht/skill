@@ -104,6 +104,7 @@ export PINCHBENCH_OFFICIAL_KEY=your_official_key
 | `--timeout-multiplier N` | Scale timeouts for slower models                                              |
 | `--thinking LEVEL`       | Reasoning depth: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `adaptive` |
 | `--output-dir DIR`       | Where to save results (default: `results/`)                                   |
+| `--record-train`         | Record successful benchmarked-model calls as training JSONL rows              |
 | `--no-upload`            | Skip uploading to leaderboard                                                 |
 | `--register`             | Request an API token for submissions                                          |
 | `--upload FILE`          | Upload a previous results JSON                                                |
@@ -156,7 +157,42 @@ We welcome new tasks! Check out [`tasks/TASK_TEMPLATE.md`](tasks/TASK_TEMPLATE.m
 
 ### Transcript Archive
 
-Session transcripts are automatically saved to `results/{run_id}_transcripts/` alongside the results JSON. Each task's full agent conversation is preserved as a JSONL file (e.g. `task_calendar.jsonl`) for post-run analysis.
+Session transcripts are automatically saved to `results/{run_id}_transcripts/` alongside the results JSON. Each run writes its own JSONL archive using a run-scoped filename (for example `0005-task_calendar-run001.jsonl`), so multi-run benchmarks do not overwrite one another.
+
+### Training Data Recording
+
+Use `--record-train` to capture successful **benchmarked model** calls into a single JSONL file for that benchmark invocation:
+
+```bash
+./scripts/run.sh \
+  --model openrouter/anthropic/claude-sonnet-4 \
+  --suite task_calendar,task_files \
+  --runs 3 \
+  --record-train \
+  --no-upload
+```
+
+This writes:
+
+- `results/{run_id}_train.jsonl`
+
+For example, if you run 4 tasks with `--runs 3`, PinchBench performs 12 task executions total. All successful captured calls from that benchmark invocation are appended to the same `results/{run_id}_train.jsonl` file.
+
+Each JSONL row has this shape:
+
+```json
+{"task_id":"task_calendar","run_index":2,"messages":[...],"tools":[...]}
+```
+
+Notes:
+
+- Only **successful benchmarked-model calls** are recorded.
+- Judge calls are **not** included.
+- `task_id` identifies the task source for the sample.
+- `run_index` is the 1-based execution index within `--runs N` for that task.
+- `messages` is normalized into a training-friendly conversation format including `system`, `user`, `assistant`, and `tool` messages when present.
+- `tools` is included only when that model call exposed tool schemas.
+- The recorder currently supports benchmarked providers using `openai-completions` and `anthropic-messages` APIs.
 
 ## Links
 
