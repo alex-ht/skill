@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import platform
+import re
 import stat
 import subprocess
 import time
@@ -540,9 +541,25 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
     # Get agent's workspace from agent config
     workspace = _get_agent_workspace(agent_id)
     if workspace is None:
-        # Fallback to task-specific workspace if agent workspace not found
-        logger.warning("Could not find agent workspace, using fallback")
-        workspace = Path(f"/tmp/pinchbench/{run_id}/{task.task_id}")
+        # Fallback to the benchmark workspace layout when the agent list is not
+        # immediately consistent after creation.
+        fallback_match = re.match(r"^(\d+)-(.+)-run(\d+)$", run_id)
+        if fallback_match:
+            benchmark_run_id, _, run_index = fallback_match.groups()
+            workspace = (
+                Path("/tmp/pinchbench")
+                / benchmark_run_id
+                / "workspaces"
+                / task.task_id
+                / f"run_{int(run_index):03d}"
+            )
+            logger.warning(
+                "Could not find agent workspace, using benchmark-layout fallback: %s",
+                workspace,
+            )
+        else:
+            logger.warning("Could not find agent workspace, using legacy fallback")
+            workspace = Path(f"/tmp/pinchbench/{run_id}/{task.task_id}")
 
     _BOOTSTRAP_FILES = ["SOUL.md", "BOOTSTRAP.md", "USER.md", "IDENTITY.md", "HEARTBEAT.md", "TOOLS.md"]
 
