@@ -653,12 +653,13 @@ def _get_agent_store_dir(agent_id: str) -> Path:
     base_dir = Path.home() / ".openclaw" / "agents"
     normalized_id = agent_id.replace(":", "-").lower()
     direct_dir = base_dir / agent_id
-    if direct_dir.exists():
-        return direct_dir
     normalized_dir = base_dir / normalized_id
-    if normalized_dir.exists():
-        return normalized_dir
 
+    # Prefer the actual Agent dir reported by OpenClaw. Long agent ids may be
+    # stored under a truncated display-name directory with the full id exposed
+    # only as an alias in `openclaw agents list`. If we eagerly return a
+    # locally-created fallback directory here, later transcript/session lookups
+    # can point at the wrong store and falsely report missing sessions.
     try:
         list_result = subprocess.run(
             ["openclaw", "agents", "list"],
@@ -693,10 +694,18 @@ def _get_agent_store_dir(agent_id: str) -> Path:
                 if current_names and current_dir is not None:
                     normalized_names = {name.replace(":", "-").lower() for name in current_names}
                     if normalized_id in normalized_names:
-                        return current_dir.parent if current_dir.name == "agent" else current_dir
+                        resolved = current_dir.parent if current_dir.name == "agent" else current_dir
+                        logger.info("Resolved agent store dir for %s -> %s", agent_id, resolved)
+                        return resolved
     except Exception as exc:
         logger.warning("Failed to resolve agent store dir for %s: %s", agent_id, exc)
 
+    if direct_dir.exists():
+        logger.info("Falling back to direct agent store dir for %s -> %s", agent_id, direct_dir)
+        return direct_dir
+    if normalized_dir.exists():
+        logger.info("Falling back to normalized agent store dir for %s -> %s", agent_id, normalized_dir)
+        return normalized_dir
     return direct_dir
 
 

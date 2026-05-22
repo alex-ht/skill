@@ -14,6 +14,7 @@ from the tasks/ directory.
 
 import argparse
 import atexit
+import hashlib
 import importlib.metadata
 import json
 import logging
@@ -395,6 +396,23 @@ def _next_run_id(run_root: Path) -> str:
             existing.append(int(entry.name))
     next_id = (max(existing) + 1) if existing else 1
     return f"{next_id:04d}"
+
+
+def _build_execution_agent_id(*, model_id: str, run_id: str, task_id: str, run_index: int) -> str:
+    """Build a short, stable, collision-resistant agent id for one task run.
+
+    OpenClaw may truncate long agent ids in storage/display paths. If we embed the
+    full model slug and full task id, distinct runs can collapse to the same
+    truncated prefix and fail agent creation. Keep the id short and add a hash so
+    each run remains unique without depending on the tail of a very long name.
+    """
+    short_task = task_id.removeprefix("task_").replace("_", "-").lower()
+    short_task = re.sub(r"[^a-z0-9-]+", "-", short_task).strip("-")
+    short_task = short_task[:24].rstrip("-") or "task"
+    digest = hashlib.sha1(
+        f"{model_id}|{run_id}|{task_id}|{run_index}".encode("utf-8")
+    ).hexdigest()[:8]
+    return f"bench-{run_id}-{short_task}-r{run_index:03d}-{digest}"
 
 
 def _load_ascii_art(script_dir: Path, filename: str) -> str | None:
@@ -943,9 +961,9 @@ def main():
     run_id = _next_run_id(run_root)
     benchmark_run_dir = run_root / run_id
     skill_dir = skill_root
-    # Each task/run gets its own agent ID and workspace so no execution reuses
-    # another run's workspace or local agent state.
-    agent_id_prefix = f"bench-{model_slug}-{run_id}"
+    # Each task/run gets its own workspace and a short unique agent ID so no
+    # execution reuses another run's local state, while also avoiding collisions
+    # caused by very long model/task names being truncated by OpenClaw.
 
     # The benchmarked model is passed through as-is so local/custom model IDs
     # can run without OpenRouter catalog validation. Judge models still validate
@@ -1170,8 +1188,11 @@ def main():
             logger.info("%s", "=" * 80)
             execution_error = None
             execution_run_id = f"{run_id}-{task.task_id}-run{run_index + 1:03d}"
-            execution_agent_id = (
-                f"{agent_id_prefix}-{task.task_id.replace('_', '-')}-run{run_index + 1:03d}"
+            execution_agent_id = _build_execution_agent_id(
+                model_id=args.model,
+                run_id=run_id,
+                task_id=task.task_id,
+                run_index=run_index + 1,
             )
             execution_workspace = (
                 benchmark_run_dir
