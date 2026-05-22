@@ -561,7 +561,7 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
             logger.warning("Could not find agent workspace, using legacy fallback")
             workspace = Path(f"/tmp/pinchbench/{run_id}/{task.task_id}")
 
-    _BOOTSTRAP_FILES = ["SOUL.md", "BOOTSTRAP.md", "USER.md", "IDENTITY.md", "HEARTBEAT.md", "TOOLS.md"]
+    _BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "BOOTSTRAP.md", "USER.md", "IDENTITY.md", "HEARTBEAT.md", "TOOLS.md"]
 
     def _remove_readonly(func, path, _):
         try:
@@ -579,23 +579,54 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
         shutil.rmtree(workspace, onerror=_remove_readonly)
     workspace.mkdir(parents=True, exist_ok=True)
 
-    for fname, content in saved_bootstrap.items():
-        (workspace / fname).write_bytes(content)
+    # Copy latest bootstrap files from main workspace (so AGENTS.md edits take effect immediately)
+    main_workspace = Path.home() / ".openclaw" / "workspace"
+    for fname in _BOOTSTRAP_FILES:
+        src = main_workspace / fname
+        if src.exists():
+            (workspace / fname).write_bytes(src.read_bytes())
+            logger.info("Copied latest %s from main workspace", fname)
+        elif fname in saved_bootstrap:
+            # Fallback to previously saved content if main workspace file is missing
+            (workspace / fname).write_bytes(saved_bootstrap[fname])
 
-    for file_spec in task.workspace_files:
+    # Copy workspace_files declared in the task definition
+    if not task.workspace_files:
+        logger.warning("Task %s has no workspace_files defined", task.task_id)
+    else:
+        logger.info("Task %s has %d workspace_files to copy", task.task_id, len(task.workspace_files))
+
+    for idx, file_spec in enumerate(task.workspace_files):
         if "content" in file_spec:
             dest = workspace / file_spec["path"]
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(file_spec["content"])
+            logger.info("[workspace_files][%d] Wrote inline content to %s", idx, dest)
             continue
 
         source = skill_dir / "assets" / file_spec["source"]
         dest = workspace / file_spec["dest"]
         dest.parent.mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            "[workspace_files][%d] Copying: source=%s -> dest=%s (workspace=%s)",
+            idx, source, dest, workspace
+        )
         try:
-            dest.write_bytes(source.read_bytes())
-        except FileNotFoundError:
-            logger.error("Workspace file not found: %s", source)
+            if not source.exists():
+                logger.error("[workspace_files][%d] SOURCE FILE NOT FOUND: %s", idx, source)
+                raise FileNotFoundError(str(source))
+            data = source.read_bytes()
+            dest.write_bytes(data)
+            logger.info(
+                "[workspace_files][%d] SUCCESS: Copied %d bytes to %s",
+                idx, len(data), dest
+            )
+        except Exception as exc:
+            logger.error(
+                "[workspace_files][%d] FAILED to copy %s -> %s: %s",
+                idx, source, dest, exc
+            )
             raise
 
     # Copy skills from main workspace to benchmark workspace
