@@ -173,6 +173,23 @@ def save_token_config(token: str, claim_url: str | None = None) -> Path:
     return CONFIG_PATH
 
 
+def _mean_score_for_task_runs(task_runs: list[dict[str, Any]]) -> float:
+    """Average a task's score across execution runs."""
+    first_grading = task_runs[0].get("grading", {})
+    all_runs = first_grading.get("runs", [])
+    # Legacy bug: each execution entry duplicated the full multi-run grade block.
+    if (
+        len(task_runs) > 1
+        and isinstance(all_runs, list)
+        and len(all_runs) == len(task_runs)
+        and len(all_runs) > 1
+    ):
+        return float(first_grading.get("mean", 0.0))
+    return sum(float(run.get("grading", {}).get("mean", 0.0)) for run in task_runs) / len(
+        task_runs
+    )
+
+
 def _build_payload(results_path: Path) -> Dict[str, Any]:
     raw = json.loads(results_path.read_text(encoding="utf-8"))
     tasks = raw.get("tasks", [])
@@ -187,14 +204,16 @@ def _build_payload(results_path: Path) -> Dict[str, Any]:
         "total_cost_usd": 0.0,
     }
 
-    formatted_tasks: list[dict[str, Any]] = []
+    grouped_tasks: dict[str, list[dict[str, Any]]] = {}
     for task in tasks:
-        grading = task.get("grading", {})
+        grouped_tasks.setdefault(task.get("task_id"), []).append(task)
+
+    formatted_tasks: list[dict[str, Any]] = []
+    for task_id, task_runs in grouped_tasks.items():
+        representative = task_runs[0]
+        grading = representative.get("grading", {})
         runs = grading.get("runs", []) if isinstance(grading.get("runs", []), list) else []
-        if "score" in grading:
-            score = float(grading.get("score", 0.0))
-        else:
-            score = float(grading.get("mean", 0.0))
+        score = _mean_score_for_task_runs(task_runs)
 
         if "max_score" in grading:
             max_for_task = float(grading.get("max_score", 0.0))
@@ -210,14 +229,19 @@ def _build_payload(results_path: Path) -> Dict[str, Any]:
         total_score += score
         max_score += max_for_task
 
-        usage = task.get("usage", {})
-        total_execution_time += float(task.get("execution_time", 0.0) or 0.0)
-        cost_usd = float(usage.get("cost_usd", 0.0) or 0.0)
-        total_cost_usd += cost_usd
-        usage_summary["total_input_tokens"] += int(usage.get("input_tokens", 0))
-        usage_summary["total_output_tokens"] += int(usage.get("output_tokens", 0))
-        usage_summary["total_requests"] += int(usage.get("request_count", 0))
-        usage_summary["total_cost_usd"] += cost_usd
+        execution_time = 0.0
+        timed_out = False
+        for task in task_runs:
+            execution_time += float(task.get("execution_time", 0.0) or 0.0)
+            timed_out = timed_out or bool(task.get("timed_out"))
+            usage = task.get("usage", {})
+            cost_usd = float(usage.get("cost_usd", 0.0) or 0.0)
+            total_cost_usd += cost_usd
+            usage_summary["total_input_tokens"] += int(usage.get("input_tokens", 0))
+            usage_summary["total_output_tokens"] += int(usage.get("output_tokens", 0))
+            usage_summary["total_requests"] += int(usage.get("request_count", 0))
+            usage_summary["total_cost_usd"] += cost_usd
+        total_execution_time += execution_time
 
         grading_type = grading.get("grading_type")
         if not grading_type and runs:
@@ -234,19 +258,19 @@ def _build_payload(results_path: Path) -> Dict[str, Any]:
             notes = ""
 
         task_entry: dict[str, Any] = {
-            "task_id": task.get("task_id"),
+            "task_id": task_id,
             "score": score,
             "max_score": max_for_task,
             "grading_type": grading_type,
-            "timed_out": bool(task.get("timed_out")),
-            "execution_time_seconds": task.get("execution_time"),
+            "timed_out": timed_out,
+            "execution_time_seconds": execution_time,
             "breakdown": breakdown,
             "notes": notes,
-            "frontmatter": task.get("frontmatter", {}),
+            "frontmatter": representative.get("frontmatter", {}),
         }
         # Include manifest-derived category as a first-class field
-        if "category" in task:
-            task_entry["category"] = task["category"]
+        if "category" in representative:
+            task_entry["category"] = representative["category"]
         formatted_tasks.append(task_entry)
 
     client_version = _read_client_version()

@@ -14,6 +14,40 @@ from typing import Dict, List, Optional
 logger = logging.getLogger("benchmark")
 
 
+def _mean_score_for_task_runs(task_runs: list[dict]) -> float:
+    """Average a task's score across execution runs."""
+    first_grading = task_runs[0].get("grading", {})
+    all_runs = first_grading.get("runs", [])
+    # Legacy bug: each execution entry duplicated the full multi-run grade block.
+    if (
+        len(task_runs) > 1
+        and isinstance(all_runs, list)
+        and len(all_runs) == len(task_runs)
+        and len(all_runs) > 1
+    ):
+        return float(first_grading.get("mean", 0.0))
+    return statistics.mean(
+        float(run.get("grading", {}).get("mean", 0.0)) for run in task_runs
+    )
+
+
+def _aggregate_task_scores(tasks: list[dict]) -> tuple[float, int]:
+    """Return overall score percent and unique task count."""
+    grouped: dict[str, list[dict]] = {}
+    for task in tasks:
+        if "grading" not in task:
+            continue
+        grouped.setdefault(task["task_id"], []).append(task)
+
+    if not grouped:
+        return 0.0, 0
+
+    total_score = sum(_mean_score_for_task_runs(task_runs) for task_runs in grouped.values())
+    unique_task_count = len(grouped)
+    score_pct = (total_score / unique_task_count) * 100
+    return score_pct, unique_task_count
+
+
 @dataclass
 class RunPoint:
     """A single data point from a benchmark run."""
@@ -99,18 +133,13 @@ class RunTrendAnalyzer:
             if not tasks:
                 continue
 
-            total = sum(
-                t["grading"]["mean"]
-                for t in tasks
-                if "grading" in t
-            )
-            score_pct = (total / len(tasks)) * 100
+            score_pct, unique_task_count = _aggregate_task_scores(tasks)
 
             if model and m != model:
                 continue
 
             grouped.setdefault(m, []).append(
-                RunPoint(run_id, ts, m, score_pct, len(tasks))
+                RunPoint(run_id, ts, m, score_pct, unique_task_count)
             )
 
         for pts in grouped.values():

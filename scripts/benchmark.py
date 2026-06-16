@@ -521,6 +521,29 @@ def _colorize_gradient(ascii_art: str) -> str:
     return "\n".join(colored_lines)
 
 
+def _single_run_grading(grade: GradeResult) -> Dict[str, Any]:
+    """Wrap one GradeResult in the multi-run grading block shape."""
+    score = grade.score
+    return {
+        "runs": [grade.to_dict()],
+        "mean": score,
+        "std": 0.0,
+        "min": score,
+        "max": score,
+    }
+
+
+def _grading_for_result(
+    result: Dict[str, Any],
+    grades_by_task_id: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Return grading for a single execution result."""
+    grade = result.get("_grade")
+    if isinstance(grade, GradeResult):
+        return _single_run_grading(grade)
+    return grades_by_task_id.get(result["task_id"], {})
+
+
 def _compute_efficiency_summary(
     task_entries: List[Dict[str, Any]],
     grades_by_task_id: Dict[str, Dict[str, Any]],
@@ -539,12 +562,11 @@ def _compute_efficiency_summary(
     total_execution_time = 0.0
     tasks_with_usage = 0
 
+    usage_by_task_id: Dict[str, Dict[str, Any]] = {}
     per_task_efficiency: List[Dict[str, Any]] = []
     for entry in task_entries:
         usage = entry.get("usage", {})
         task_id = entry["task_id"]
-        grading = grades_by_task_id.get(task_id, {})
-        score = float(grading.get("mean", 0.0))
 
         inp = int(usage.get("input_tokens", 0))
         out = int(usage.get("output_tokens", 0))
@@ -563,6 +585,21 @@ def _compute_efficiency_summary(
         if tot > 0:
             tasks_with_usage += 1
 
+        task_usage = usage_by_task_id.setdefault(
+            task_id,
+            {
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+            },
+        )
+        task_usage["total_tokens"] += tot
+        task_usage["cost_usd"] += cost
+
+    for task_id, task_usage in usage_by_task_id.items():
+        grading = grades_by_task_id.get(task_id, {})
+        score = float(grading.get("mean", 0.0))
+        tot = int(task_usage["total_tokens"])
+        cost = float(task_usage["cost_usd"])
         per_task_efficiency.append(
             {
                 "task_id": task_id,
@@ -638,11 +675,11 @@ def _log_efficiency_summary(
 
 
 def _compute_category_scores(
-    task_entries: List[Dict[str, Any]],
+    grades_by_task_id: Dict[str, Dict[str, Any]],
     tasks_by_id: Dict[str, Any],
     category_order: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """Compute per-category score rollups from task results.
+    """Compute per-category score rollups from aggregated task grades.
 
     Returns a dict mapping category name to a dict with keys:
     ``score``, ``max_score``, ``pct``, ``task_count``.
@@ -653,14 +690,12 @@ def _compute_category_scores(
     """
     raw: Dict[str, Dict[str, float]] = {}
 
-    for entry in task_entries:
-        task_id = entry["task_id"]
+    for task_id, grading in grades_by_task_id.items():
         task = tasks_by_id.get(task_id)
         if not task:
             continue
 
         category = task.category.upper() if task.category else "UNCATEGORIZED"
-        grading = entry.get("grading", {})
         mean_score = float(grading.get("mean", 0.0))
         max_score = 1.0  # Each task is scored 0-1
 
@@ -694,7 +729,7 @@ def _compute_category_scores(
 
 
 def _log_category_summary(
-    task_entries: List[Dict[str, Any]],
+    grades_by_task_id: Dict[str, Dict[str, Any]],
     tasks_by_id: Dict[str, Any],
     category_order: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
@@ -703,7 +738,7 @@ def _log_category_summary(
     Returns the computed category_scores dict so callers can embed it in
     results JSON.
     """
-    category_scores = _compute_category_scores(task_entries, tasks_by_id, category_order)
+    category_scores = _compute_category_scores(grades_by_task_id, tasks_by_id, category_order)
 
     # Calculate overall totals
     total_earned = sum(c["score"] for c in category_scores.values())
@@ -1044,9 +1079,11 @@ def main():
             "transcript_length": len(r["transcript"]),
             "usage": r.get("usage", {}),
             "workspace": r["workspace"],
-            "grading": grades_by_task_id.get(tid, {}),
+            "grading": _grading_for_result(r, grades_by_task_id),
             "frontmatter": tasks_by_id[tid].frontmatter,
         }
+        if runs_per_task > 1:
+            entry["run_index"] = r.get("run_index")
         if category_map:
             entry["category"] = category_map.get(tid, "")
         return entry
@@ -1054,7 +1091,7 @@ def main():
     def _write_incremental_results():
         task_entries = [_build_task_entry(r) for r in results]
         efficiency = _compute_efficiency_summary(task_entries, grades_by_task_id)
-        cat_scores = _compute_category_scores(task_entries, tasks_by_id, category_order)
+        cat_scores = _compute_category_scores(grades_by_task_id, tasks_by_id, category_order)
         partial = {
             "model": args.model,
             "benchmark_version": _get_benchmark_version(skill_root),
@@ -1326,6 +1363,8 @@ def main():
                         notes=note,
                     )
                 task_grades.append(grade)
+                result["run_index"] = run_index + 1
+                result["_grade"] = grade
 
                 # Log score immediately after grading
                 score_pct = grade.score / grade.max_score * 100 if grade.max_score > 0 else 0
@@ -1433,7 +1472,7 @@ def main():
         """Build aggregate result from completed tasks and write to output_path."""
         task_entries = [_build_task_entry(r) for r in results]
         efficiency = _compute_efficiency_summary(task_entries, grades_by_task_id)
-        cat_scores = _compute_category_scores(task_entries, tasks_by_id, category_order)
+        cat_scores = _compute_category_scores(grades_by_task_id, tasks_by_id, category_order)
         aggregate = {
             "model": args.model,
             "benchmark_version": _get_benchmark_version(skill_root),
@@ -1470,7 +1509,7 @@ def main():
             )
 
     logger.info("Saved results to %s", output_path)
-    _log_category_summary(task_entries, tasks_by_id, category_order)
+    _log_category_summary(grades_by_task_id, tasks_by_id, category_order)
     _log_efficiency_summary(efficiency, grades_by_task_id)
     # Run trend analysis if requested
     if args.trend:
