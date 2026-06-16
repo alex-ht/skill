@@ -26,7 +26,7 @@ DEFAULT_JUDGE_AGENT_PREFIX = "bench-judge"
 DEFAULT_JUDGE_TIMEOUT_SECONDS = 300
 
 # Judge result cache: maps cache_key -> GradeResult dict
-# Cache key = hash of (task_id, transcript_summary, rubric, judge_model)
+# Cache key = hash of (task_id, transcript_summary, rubric, judge_model, workspace_content)
 _judge_cache: Dict[str, Dict[str, Any]] = {}
 _judge_cache_dir: Optional[Path] = None
 
@@ -73,9 +73,10 @@ def _compute_cache_key(
     backend: str = "api",
     base_url: Optional[str] = None,
     api_format: str = "openai",
+    workspace_content: str = "",
 ) -> str:
     """Compute a cache key from grading inputs."""
-    content = f"{task_id}|{transcript}|{rubric}|{model}|{backend}|{base_url or ''}|{api_format}"
+    content = f"{task_id}|{transcript}|{rubric}|{model}|{workspace_content}|{backend}|{base_url or ''}|{api_format}"
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
@@ -316,6 +317,7 @@ def _grade_llm_judge(
         backend=judge_backend,
         base_url=judge_base_url,
         api_format=judge_api_format,
+        workspace_content=workspace_content,
     )
     if cache_key in _judge_cache:
         cached = _judge_cache[cache_key]
