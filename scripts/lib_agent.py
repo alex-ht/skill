@@ -795,24 +795,64 @@ def _find_transcript_path_from_sessions_store(
     return None
 
 
-def _find_recent_session_path(agent_dir: Path, started_at: float) -> Path | None:
+def _collect_all_recent_transcript_paths(agent_id: str, started_at: float) -> List[Path]:
+    """Collect transcript files written for this run, including any spawned child sessions.
+
+    Spawned sessions (via OpenClaw sessions_spawn / subagent spawns) get their
+    own .jsonl files. We must include them or we only see the parent turn that
+    issued the spawn and mistakenly believe execution finished.
+    """
+    agent_dir = _get_agent_store_dir(agent_id)
     sessions_dir = agent_dir / "sessions"
     if not sessions_dir.exists():
-        return None
+        return []
     candidates = [
         p for p in
         list(sessions_dir.rglob("*.jsonl")) + list(sessions_dir.rglob("*.ndjson"))
         if ".trajectory" not in p.name and ".trajectory-path" not in p.name
     ]
-
     if not candidates:
-        return None
+        return []
     tolerance_seconds = 5.0
-    recent_candidates = [
+    recent = [
         path for path in candidates if path.stat().st_mtime >= (started_at - tolerance_seconds)
     ]
-    pool = recent_candidates or candidates
-    return max(pool, key=lambda path: path.stat().st_mtime)
+    pool = recent or candidates
+    return sorted(pool, key=lambda path: path.stat().st_mtime)
+
+
+def _wait_for_activity_settle(
+    agent_id: str, started_at: float, max_extra_seconds: float = 60.0, idle_grace_seconds: float = 3.0
+) -> None:
+    """After the openclaw CLI returns, wait until no more writes to any session transcripts.
+
+    When the agent uses session spawn, the CLI exits after the *parent* turn
+    completes (spawn request issued). Child sessions keep appending to their
+    own transcripts. Waiting here prevents the benchmark from treating the
+    task as "done" too early and snapshotting an incomplete transcript.
+    """
+    agent_dir = _get_agent_store_dir(agent_id)
+    sessions_dir = agent_dir / "sessions"
+    if not sessions_dir.exists():
+        return
+    deadline = time.time() + max_extra_seconds
+    last_change = time.time()
+    while time.time() < deadline:
+        try:
+            cands = [
+                p for p in
+                list(sessions_dir.rglob("*.jsonl")) + list(sessions_dir.rglob("*.ndjson"))
+                if ".trajectory" not in p.name and ".trajectory-path" not in p.name
+            ]
+            if cands:
+                cur = max((p.stat().st_mtime for p in cands), default=last_change)
+                if cur > last_change + 0.001:
+                    last_change = cur
+                if time.time() - last_change > idle_grace_seconds:
+                    return
+        except Exception:
+            pass
+        time.sleep(1.0)
 
 
 def _load_transcript(
@@ -827,6 +867,7 @@ def _load_transcript(
     # Strategy (with retries to handle write-delay):
     #   1. Resolve the real session ID from sessions.json
     #   2. Glob for any .jsonl in the sessions dir (most-recently-modified)
+    #      (now collects *all* to include sessions spawned by the agent)
     #   3. Try our passed-in session ID as a last resort
     for attempt in range(90):
         # 1. Try sessions.json first — OpenClaw writes the real UUID here
@@ -862,13 +903,14 @@ def _load_transcript(
             )
             break
 
-        # 2. Glob fallback — pick the most recently modified .jsonl
-        recent_path = _find_recent_session_path(agent_dir, started_at)
-        if recent_path is not None:
-            transcript_path = recent_path
+        # 2. Glob fallback — collect *all* recent (supports session spawns)
+        all_paths = _collect_all_recent_transcript_paths(agent_id, started_at)
+        if all_paths:
+            transcript_path = all_paths[-1]  # primary = latest mtime
             logger.info(
-                "Found transcript via glob fallback: %s (attempt %s)",
-                recent_path.name,
+                "Found %d transcript file(s) via glob (incl. possible spawns): %s (attempt %s)",
+                len(all_paths),
+                transcript_path.name,
                 attempt + 1,
             )
             break
@@ -915,16 +957,27 @@ def _load_transcript(
             )
         return [], None
 
+    # Load *all* recent transcripts so that work performed in spawned sessions
+    # (sessions_spawn) is included. Otherwise grading only sees the parent turn
+    # that issued the spawn and the benchmark may treat the task as finished early.
     transcript: List[Dict[str, Any]] = []
-    for line in transcript_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
+    all_paths = _collect_all_recent_transcript_paths(agent_id, started_at) or ([transcript_path] if transcript_path else [])
+    for pth in all_paths:
         try:
-            transcript.append(json.loads(line))
-        except json.JSONDecodeError as exc:
-            logger.warning("Failed to parse transcript line: %s", exc)
-            transcript.append({"raw": line, "parse_error": str(exc)})
-    return transcript, transcript_path
+            for line in pth.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    transcript.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    logger.warning("Failed to parse transcript line from %s: %s", pth.name, exc)
+                    transcript.append({"raw": line, "parse_error": str(exc), "source": str(pth.name)})
+        except Exception as exc:
+            logger.warning("Failed to read transcript %s: %s", pth, exc)
+
+    # primary path for archiving is still the latest one
+    primary_path = all_paths[-1] if all_paths else transcript_path
+    return transcript, primary_path
 
 
 def _extract_usage_from_transcript(transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -974,9 +1027,26 @@ def _archive_transcript(
     session's transcript separately before cleaning up the agent's session
     state.  This ensures the grading engine can inspect the full conversation
     history across all sessions.
+
+    We write the loaded transcript (which now includes any spawned child
+    sessions) rather than copying a single file, so spawn activity is preserved
+    even if cleanup deletes the original child transcript files.
     """
     transcript, transcript_path = _load_transcript(agent_id, current_session_id, start_time)
-    if transcript_path and output_dir:
+    if transcript and output_dir:
+        import shutil as _shutil
+        output_dir.mkdir(parents=True, exist_ok=True)
+        archive_prefix = run_id or task_id
+        archive_dest = output_dir / f"{archive_prefix}_session{session_index}.jsonl"
+        try:
+            with archive_dest.open("w", encoding="utf-8") as f:
+                for entry in transcript:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            logger.info("Archived session %d transcript (%d events, incl. spawns) to %s", session_index, len(transcript), archive_dest)
+        except OSError as exc:
+            logger.warning("Failed to archive session transcript: %s", exc)
+    elif transcript_path and output_dir:
+        # Fallback for empty-but-path case (should be rare)
         import shutil as _shutil
         output_dir.mkdir(parents=True, exist_ok=True)
         archive_prefix = run_id or task_id
@@ -1108,6 +1178,7 @@ def execute_openclaw_task(
                 exit_code = result.returncode
                 if result.returncode not in (0, -1):
                     break
+                _wait_for_activity_settle(agent_id, start_time)
             except subprocess.TimeoutExpired as exc:
                 timed_out = True
                 stdout += _coerce_subprocess_output(exc.stdout)
@@ -1145,6 +1216,7 @@ def execute_openclaw_task(
             stdout = result.stdout
             stderr = result.stderr
             exit_code = result.returncode
+            _wait_for_activity_settle(agent_id, start_time)
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             stdout = _coerce_subprocess_output(exc.stdout)
@@ -1156,6 +1228,7 @@ def execute_openclaw_task(
     # contains the last session's conversation.  Merge archived session
     # transcripts (from _archive_transcript) so the grading engine sees the
     # full history across all sessions.
+    _wait_for_activity_settle(agent_id, start_time)
     has_new_session = sessions and any(
         isinstance(s, dict) and s.get("new_session") for s in sessions
     )
@@ -1358,6 +1431,7 @@ def run_openclaw_prompt(
             exit_code = result.returncode
             if result.returncode not in (0, -1) and not timed_out:
                 break
+            _wait_for_activity_settle(agent_id, start_time)
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             stdout += _coerce_subprocess_output(exc.stdout)
@@ -1367,6 +1441,7 @@ def run_openclaw_prompt(
             stderr += f"openclaw command not found: {exc}"
             break
 
+    _wait_for_activity_settle(agent_id, start_time)
     transcript, _ = _load_transcript(agent_id, session_id, start_time)
     execution_time = time.time() - start_time
 
