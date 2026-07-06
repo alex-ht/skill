@@ -1092,8 +1092,10 @@ def execute_openclaw_task(
         else:
             fws_env = start_fws()
 
-    # Use --local for fws tasks so env vars propagate to the agent
-    use_local = fws_env is not None
+    # Use --local so dynamically-created bench agents bypass the gateway
+    # (gateway only recognises pre-registered agents; fws tasks also need it
+    # for env var propagation)
+    use_local = True
 
     start_time = time.time()
     workspace = prepare_task_workspace(skill_dir, run_id, task, agent_id)
@@ -1587,7 +1589,7 @@ def _judge_via_anthropic_compat(
     payload = json.dumps({
         "model": bare_model,
         "max_tokens": 2048,
-        "temperature": 0.0,
+        #"temperature": 0.0,
         "system": _JUDGE_SYSTEM_MSG,
         "messages": [{"role": "user", "content": prompt}],
     }).encode("utf-8")
