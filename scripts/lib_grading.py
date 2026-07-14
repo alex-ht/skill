@@ -126,6 +126,7 @@ def grade_task(
     execution_result: Dict[str, Any],
     skill_dir: Path,
     judge_model: str = DEFAULT_JUDGE_MODEL,
+    judge_fallback_model: Optional[str] = None,
     judge_agent_prefix: str = DEFAULT_JUDGE_AGENT_PREFIX,
     judge_timeout_seconds: float = DEFAULT_JUDGE_TIMEOUT_SECONDS,
     judge_backend: str = "api",
@@ -149,6 +150,7 @@ def grade_task(
             task=task,
             execution_result=execution_result,
             judge_model=judge_model,
+            judge_fallback_model=judge_fallback_model,
             judge_agent_prefix=judge_agent_prefix,
             judge_timeout_seconds=judge_timeout_seconds,
             judge_backend=judge_backend,
@@ -167,6 +169,7 @@ def grade_task(
             task=task,
             execution_result=execution_result,
             judge_model=judge_model,
+            judge_fallback_model=judge_fallback_model,
             judge_agent_prefix=judge_agent_prefix,
             judge_timeout_seconds=judge_timeout_seconds,
             judge_backend=judge_backend,
@@ -267,6 +270,7 @@ def _grade_llm_judge(
     task: Task,
     execution_result: Dict[str, Any],
     judge_model: str,
+    judge_fallback_model: Optional[str] = None,
     judge_agent_prefix: str,
     judge_timeout_seconds: float,
     judge_backend: str = "api",
@@ -340,66 +344,77 @@ def _grade_llm_judge(
 
     max_judge_attempts = 2
     raw_parsed: Dict[str, Any] = {}
-    for attempt in range(max_judge_attempts):
-        if judge_backend == "api":
-            # Direct API call — bypasses OpenClaw personality injection
-            judge_result = call_judge_api(
-                prompt=prompt,
-                model=judge_model,
-                timeout_seconds=judge_timeout_seconds,
-                base_url=judge_base_url,
-                api_key=judge_api_key,
-                api_format=judge_api_format,
+    models_to_try = [m for m in [judge_model, judge_fallback_model] if m]
+    for model_index, active_model in enumerate(models_to_try):
+        if model_index > 0:
+            logger.warning(
+                "Primary judge model failed; retrying with fallback model: %s", active_model
             )
-
-            if verbose:
-                logger.info("   [VERBOSE] Judge execution status: %s", judge_result.get("status"))
-                if judge_result.get("error"):
-                    logger.info("   [VERBOSE] Judge error: %s", judge_result["error"])
-
-            if judge_result.get("status") != "success":
-                logger.warning(
-                    "Judge API call failed (attempt %d/%d): %s",
-                    attempt + 1,
-                    max_judge_attempts,
-                    judge_result.get("error", judge_result.get("status")),
+        for attempt in range(max_judge_attempts):
+            if judge_backend == "api":
+                # Direct API call — bypasses OpenClaw personality injection
+                judge_result = call_judge_api(
+                    prompt=prompt,
+                    model=active_model,
+                    timeout_seconds=judge_timeout_seconds,
+                    base_url=judge_base_url,
+                    api_key=judge_api_key,
+                    api_format=judge_api_format,
                 )
-                if attempt < max_judge_attempts - 1:
-                    time.sleep(2**attempt)
-                    continue
 
-            raw_parsed = _parse_judge_text(judge_result.get("text", ""))
-        else:
-            # Default: OpenClaw agent session
-            judge_skill_dir = skill_dir if skill_dir is not None else Path.cwd()
-            agent_id = _ensure_judge_agent(judge_agent_prefix, judge_model, judge_skill_dir)
-            judge_workspace = Path(f"/tmp/pinchbench/judge/{task.task_id}")
-            judge_result = run_openclaw_prompt(
-                agent_id=agent_id,
-                prompt=prompt,
-                workspace=judge_workspace,
-                timeout_seconds=judge_timeout_seconds,
-            )
+                if verbose:
+                    logger.info("   [VERBOSE] Judge execution status: %s", judge_result.get("status"))
+                    if judge_result.get("error"):
+                        logger.info("   [VERBOSE] Judge error: %s", judge_result["error"])
 
-            if verbose:
-                logger.info("   [VERBOSE] Judge execution status: %s", judge_result.get("status"))
-                logger.info("   [VERBOSE] Judge exit code: %s", judge_result.get("exit_code"))
-                logger.info("   [VERBOSE] Judge stderr: %s", judge_result.get("stderr", "")[:500])
+                if judge_result.get("status") != "success":
+                    logger.warning(
+                        "Judge API call failed (model=%s attempt %d/%d): %s",
+                        active_model,
+                        attempt + 1,
+                        max_judge_attempts,
+                        judge_result.get("error", judge_result.get("status")),
+                    )
+                    if attempt < max_judge_attempts - 1:
+                        time.sleep(2**attempt)
+                        continue
 
-            if judge_result.get("status") != "success":
-                logger.warning(
-                    "Judge execution failed (attempt %d/%d): %s",
-                    attempt + 1,
-                    max_judge_attempts,
-                    judge_result.get("status"),
+                raw_parsed = _parse_judge_text(judge_result.get("text", ""))
+            else:
+                # Default: OpenClaw agent session
+                judge_skill_dir = skill_dir if skill_dir is not None else Path.cwd()
+                agent_id = _ensure_judge_agent(judge_agent_prefix, active_model, judge_skill_dir)
+                judge_workspace = Path(f"/tmp/pinchbench/judge/{task.task_id}")
+                judge_result = run_openclaw_prompt(
+                    agent_id=agent_id,
+                    prompt=prompt,
+                    workspace=judge_workspace,
+                    timeout_seconds=judge_timeout_seconds,
                 )
-                if attempt < max_judge_attempts - 1:
-                    time.sleep(2**attempt)
-                    continue
 
-            raw_parsed = _parse_judge_response(judge_result.get("transcript", []))
+                if verbose:
+                    logger.info("   [VERBOSE] Judge execution status: %s", judge_result.get("status"))
+                    logger.info("   [VERBOSE] Judge exit code: %s", judge_result.get("exit_code"))
+                    logger.info("   [VERBOSE] Judge stderr: %s", judge_result.get("stderr", "")[:500])
 
-        break  # Parsed response; exit loop after success or after the final failed attempt
+                if judge_result.get("status") != "success":
+                    logger.warning(
+                        "Judge execution failed (model=%s attempt %d/%d): %s",
+                        active_model,
+                        attempt + 1,
+                        max_judge_attempts,
+                        judge_result.get("status"),
+                    )
+                    if attempt < max_judge_attempts - 1:
+                        time.sleep(2**attempt)
+                        continue
+
+                raw_parsed = _parse_judge_response(judge_result.get("transcript", []))
+
+            break  # Parsed response; exit attempt loop after success or final failed attempt
+
+        if raw_parsed:
+            break  # Got a valid response; no need to try the fallback model
 
     if verbose:
         logger.info("   [VERBOSE] Judge raw response parsed: %s", raw_parsed)

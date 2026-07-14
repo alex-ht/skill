@@ -95,10 +95,12 @@ export PINCHBENCH_OFFICIAL_KEY=your_official_key
 | ------------------------ | ----------------------------------------------------------------------------- |
 | `--model MODEL`          | Model to test (e.g., `openrouter/anthropic/claude-sonnet-4`)                  |
 | `--judge MODEL`          | Judge model for LLM grading; uses direct API when set (see below)             |
+| `--judge-fallback MODEL` | Fallback judge model used when the primary judge fails all retries            |
 | `--base-url URL`         | Custom OpenAI-compatible endpoint for the benchmarked agent model             |
 | `--api-key KEY`          | API key for the benchmarked agent custom endpoint                             |
 | `--judge-base-url URL`   | Custom OpenAI-compatible endpoint for the judge model                         |
 | `--judge-api-key KEY`    | API key for the judge custom endpoint                                         |
+| `--judge-api-format FMT` | Protocol for `--judge-base-url`: `openai` (default) or `anthropic`           |
 | `--suite SUITE`          | `all`, `automated-only`, or comma-separated task IDs                          |
 | `--runs N`               | Number of runs per task for averaging                                         |
 | `--timeout-multiplier N` | Scale timeouts for slower models                                              |
@@ -108,6 +110,7 @@ export PINCHBENCH_OFFICIAL_KEY=your_official_key
 | `--no-upload`            | Skip uploading to leaderboard                                                 |
 | `--register`             | Request an API token for submissions                                          |
 | `--upload FILE`          | Upload a previous results JSON                                                |
+| `--continue FILE`        | Resume an interrupted run from a partial results JSON (see below)             |
 | `--official-key KEY`     | Mark submission as official (or use `PINCHBENCH_OFFICIAL_KEY` env var)        |
 
 ### Judge
@@ -141,6 +144,14 @@ By default (no `--judge` flag), the LLM judge runs as an OpenClaw agent session.
   --judge-api-key "$AZURE_OPENAI_API_KEY"
 ```
 
+Use `--judge-fallback` to specify a backup model that is tried automatically when the primary judge fails all retry attempts:
+
+```bash
+./scripts/run.sh --model openai/gpt-4o \
+  --judge openrouter/anthropic/claude-haiku-4-5 \
+  --judge-fallback openrouter/openai/gpt-4o-mini
+```
+
 For custom OpenAI-compatible judge endpoints, `--judge-base-url` may be either:
 - a base URL such as `https://.../openai/v1`
 - or a full `.../chat/completions` endpoint
@@ -148,6 +159,23 @@ For custom OpenAI-compatible judge endpoints, `--judge-base-url` may be either:
 For Azure-style endpoints, PinchBench automatically uses the `api-key` header. If `--judge-api-key` is omitted, it falls back to `JUDGE_API_KEY`, then `AZURE_OPENAI_API_KEY` for Azure URLs, then `OPENAI_API_KEY`.
 
 Required env vars without `--judge-base-url`: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` depending on the judge model prefix.
+
+### Resuming an interrupted run
+
+If a benchmark is interrupted (Ctrl-C, network failure, etc.), pass the partial results JSON written to `results/` with `--continue` to pick up where it left off:
+
+```bash
+# Original run (interrupted after some tasks)
+./scripts/run.sh --model openrouter/anthropic/claude-sonnet-4
+
+# Resume — skips completed tasks, appends to the same results file
+./scripts/run.sh --model openrouter/anthropic/claude-sonnet-4 \
+  --continue results/0042_anthropic-claude-sonnet-4.json
+```
+
+- `--model` must match the model recorded in the file.
+- All other flags (`--judge`, `--suite`, `--runs`, etc.) can be passed normally and apply only to the remaining tasks.
+- If all tasks are already complete the command exits immediately with no changes.
 
 ## Contributing Tasks
 

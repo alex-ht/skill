@@ -226,6 +226,16 @@ def _parse_args() -> argparse.Namespace:
         help="Upload a previous run's results JSON and exit (skips benchmarking)",
     )
     parser.add_argument(
+        "--continue",
+        dest="resume",
+        metavar="RESULTS_JSON",
+        help=(
+            "Resume an interrupted benchmark run. Pass the partial results JSON written "
+            "by a previous run; already-completed tasks are skipped and results are "
+            "appended to the same file."
+        ),
+    )
+    parser.add_argument(
         "--timeout-multiplier",
         type=float,
         default=1.0,
@@ -245,6 +255,15 @@ def _parse_args() -> argparse.Namespace:
             "openrouter/anthropic/claude-haiku-4.5. Set to a model ID to call its API "
             "directly (e.g. kilo/anthropic/claude-sonnet-4-5, openai/gpt-4o, "
             "anthropic/claude-sonnet-4-5-20250514, claude)"
+        ),
+    )
+    parser.add_argument(
+        "--judge-fallback",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Fallback judge model used when the primary --judge model fails all retry attempts. "
+            "Accepts the same model ID formats as --judge."
         ),
     )
     parser.add_argument(
@@ -387,6 +406,57 @@ def _select_task_ids(
 
     # Fall back to comma-separated task IDs
     return [task_id.strip() for task_id in suite.split(",") if task_id.strip()]
+
+
+def _load_continue_state(
+    continue_path: Path,
+    tasks_to_run: List[Task],
+    runs_per_task: int,
+) -> "tuple[str, List[Task], List[Dict[str, Any]], Dict[str, Dict[str, Any]]]":
+    """Load a partial results file and return state needed to resume.
+
+    Returns (run_id, remaining_tasks, restored_results, restored_grades).
+    Tasks whose run count in the file meets runs_per_task are considered done
+    and excluded from remaining_tasks.
+    """
+    data = json.loads(continue_path.read_text(encoding="utf-8"))
+    run_id: str = data["run_id"]
+
+    # Count how many runs were recorded per task
+    run_counts: Dict[str, int] = {}
+    for entry in data.get("tasks", []):
+        tid = entry["task_id"]
+        run_counts[tid] = run_counts.get(tid, 0) + 1
+
+    completed_ids = {tid for tid, count in run_counts.items() if count >= runs_per_task}
+
+    grades_by_task_id: Dict[str, Dict[str, Any]] = {}
+    restored_results: List[Dict[str, Any]] = []
+
+    for entry in data.get("tasks", []):
+        tid = entry["task_id"]
+        if tid not in completed_ids:
+            continue
+        # Restore aggregated grade (identical across runs for same task — take first)
+        if tid not in grades_by_task_id and entry.get("grading"):
+            grades_by_task_id[tid] = entry["grading"]
+        # Reconstruct a minimal result stub so _build_task_entry works
+        stub: Dict[str, Any] = {
+            "task_id": tid,
+            "status": entry.get("status", "unknown"),
+            "timed_out": entry.get("timed_out", False),
+            "execution_time": entry.get("execution_time", 0.0),
+            # Use a list of the recorded length so len() is correct
+            "transcript": [None] * entry.get("transcript_length", 0),
+            "usage": entry.get("usage", {}),
+            "workspace": entry.get("workspace", ""),
+        }
+        if "run_index" in entry:
+            stub["run_index"] = entry["run_index"]
+        restored_results.append(stub)
+
+    remaining_tasks = [t for t in tasks_to_run if t.task_id not in completed_ids]
+    return run_id, remaining_tasks, restored_results, grades_by_task_id
 
 
 def _next_run_id(run_root: Path) -> str:
@@ -1039,7 +1109,42 @@ def main():
     if task_ids is not None:
         tasks_map = {task.task_id: task for task in runner.tasks}
         tasks_to_run = [tasks_map[tid] for tid in task_ids if tid in tasks_map]
-    tasks_by_id = {task.task_id: task for task in tasks_to_run}
+
+    runs_per_task = max(1, args.runs)
+
+    # --continue: restore completed-task state from a previous partial run
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.exists():
+            logger.error("--continue: file not found: %s", resume_path)
+            sys.exit(1)
+        try:
+            resume_data = json.loads(resume_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error("--continue: cannot read results file: %s", exc)
+            sys.exit(1)
+        if resume_data.get("model") != args.model:
+            logger.error(
+                "--continue: model mismatch (file has '%s', --model is '%s')",
+                resume_data.get("model"),
+                args.model,
+            )
+            sys.exit(1)
+        run_id, tasks_to_run, results, grades_by_task_id = _load_continue_state(
+            resume_path, tasks_to_run, runs_per_task
+        )
+        skipped = len(results) // runs_per_task if runs_per_task else len(results)
+        logger.info(
+            "▶ Resuming run %s: %d task(s) already done, %d remaining",
+            run_id,
+            skipped,
+            len(tasks_to_run),
+        )
+        if not tasks_to_run:
+            logger.info("✅ All tasks already completed — nothing to do.")
+            sys.exit(0)
+
+    tasks_by_id = {task.task_id: task for task in runner.tasks}
 
     # Initialize Axiom logging (silently no-ops if AXIOM_API_TOKEN not set)
     axiom = init_axiom(
@@ -1048,8 +1153,6 @@ def main():
         benchmark_version=_get_benchmark_version(skill_root),
     )
     axiom.run_start(total_tasks=len(tasks_to_run), suite=args.suite)
-
-    runs_per_task = max(1, args.runs)
 
     # Incremental result writer: builds partial result JSON from completed
     # tasks so external tools can poll progress while the benchmark runs.
@@ -1316,6 +1419,8 @@ def main():
                 grade_kwargs["judge_base_url"] = args.judge_base_url
                 grade_kwargs["judge_api_key"] = args.judge_api_key
                 grade_kwargs["judge_api_format"] = args.judge_api_format
+            if args.judge_fallback:
+                grade_kwargs["judge_fallback_model"] = args.judge_fallback
 
             # Parallel grading: submit to background if enabled and single run
             # For multi-run tasks, grade synchronously to maintain order
