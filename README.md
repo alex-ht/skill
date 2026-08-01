@@ -136,6 +136,10 @@ By default (no `--judge` flag), the LLM judge runs as an OpenClaw agent session.
 # Headless Claude CLI
 ./scripts/run.sh --model openai/gpt-4o --judge claude
 
+# Headless Grok CLI (requires `grok` on PATH and an authenticated session)
+./scripts/run.sh --model openai/gpt-4o --judge grok
+./scripts/run.sh --model openai/gpt-4o --judge grok:grok-4.5
+
 # Azure OpenAI-compatible endpoint for the judge
 ./scripts/run.sh \
   --model gemma-4-e4b-it \
@@ -158,7 +162,7 @@ For custom OpenAI-compatible judge endpoints, `--judge-base-url` may be either:
 
 For Azure-style endpoints, PinchBench automatically uses the `api-key` header. If `--judge-api-key` is omitted, it falls back to `JUDGE_API_KEY`, then `AZURE_OPENAI_API_KEY` for Azure URLs, then `OPENAI_API_KEY`.
 
-Required env vars without `--judge-base-url`: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` depending on the judge model prefix.
+Required env vars without `--judge-base-url`: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` depending on the judge model prefix. CLI judges (`claude`, `grok`) use the local CLI instead of API keys (`grok` must be logged in via `grok login`).
 
 ### Resuming an interrupted run
 

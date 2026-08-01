@@ -11,6 +11,7 @@ import platform
 import re
 import stat
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -453,6 +454,33 @@ def ensure_agent_exists(
         data["defaultModel"] = model_id
 
     bench_models.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
+
+    # Copy "tools" (and ensure other agent-level settings like skills filter) from main
+    # into the bench agent's config entry. Without this, when sessions are established
+    # (isNewSession path), the effective tools usage list / skillsSnapshot / policy may
+    # not fully copy the intended allow/deny/profile settings, leading to incomplete
+    # tool availability (e.g. only default plugin skills, empty prompt, or restricted policies).
+    try:
+        config = _load_openclaw_config()
+        main_entry = _find_agent_entry(config, "main")
+        bench_entry = _find_agent_entry(config, agent_id)
+        if main_entry and bench_entry:
+            changed = False
+            if "tools" in main_entry:
+                bench_entry["tools"] = json.loads(json.dumps(main_entry["tools"]))
+                changed = True
+            # Also copy skills filter if present on main (per-agent skills list)
+            if "skills" in main_entry:
+                bench_entry["skills"] = json.loads(json.dumps(main_entry["skills"]))
+                changed = True
+            if "skillsLimits" in main_entry:
+                bench_entry["skillsLimits"] = json.loads(json.dumps(main_entry["skillsLimits"]))
+                changed = True
+            if changed:
+                _write_openclaw_config(config)
+                logger.info("Copied tools/skills config from main to bench agent %s", agent_id)
+    except Exception as exc:
+        logger.warning("Failed to copy full tools/skills settings for bench agent %s: %s", agent_id, exc)
 
     if (
         training_recorder is not None
@@ -1493,6 +1521,7 @@ def call_judge_api(
       - anthropic/*  -> Anthropic Messages API
       - openai/*     -> OpenAI chat completions API
       - claude       -> headless Claude CLI (claude -p)
+      - grok         -> headless Grok CLI (grok --prompt-file)
 
     Returns {"status": str, "text": str, "error"?: str}.
     """
@@ -1503,6 +1532,8 @@ def call_judge_api(
 
     if model == "claude" or model.startswith("claude:"):
         return _judge_via_claude_cli(prompt, model, timeout_seconds)
+    if model == "grok" or model.startswith("grok:"):
+        return _judge_via_grok_cli(prompt, model, timeout_seconds)
     if model.startswith("kilo/"):
         return _judge_via_kilo(prompt, model, timeout_seconds)
     if model.startswith("anthropic/"):
@@ -1727,3 +1758,94 @@ def _judge_via_claude_cli(prompt: str, model: str, timeout_seconds: float) -> Di
     if result.returncode != 0:
         return {"status": "error", "text": "", "error": f"claude exit {result.returncode}: {result.stderr[:300]}"}
     return {"status": "success", "text": result.stdout}
+
+
+def _extract_grok_cli_text(stdout: str) -> str:
+    """Extract judge text from grok CLI stdout (plain or --output-format json)."""
+    raw = (stdout or "").strip()
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    structured = payload.get("structuredOutput")
+    if isinstance(structured, dict):
+        return json.dumps(structured, ensure_ascii=False)
+    text = payload.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+    return raw
+
+
+def _judge_via_grok_cli(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:
+    """Use headless Grok CLI as judge (grok --prompt-file).
+
+    Model forms:
+      - grok              -> default grok CLI model
+      - grok:model-name   -> pass --model model-name
+    """
+    prompt_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".txt",
+            prefix="pinchbench-judge-",
+            delete=False,
+        ) as handle:
+            handle.write(prompt)
+            prompt_path = handle.name
+
+        cmd: List[str] = [
+            "grok",
+            "--prompt-file",
+            prompt_path,
+            "--output-format",
+            "plain",
+            "--tools",
+            "",
+            "--no-subagents",
+            "--disable-web-search",
+            "--system-prompt-override",
+            _JUDGE_SYSTEM_MSG,
+            "--verbatim",
+            "--no-memory",
+            "--no-plan",
+            "--max-turns",
+            "1",
+        ]
+        # Support "grok:model-name" to pass --model
+        if ":" in model:
+            _, cli_model = model.split(":", 1)
+            if cli_model:
+                cmd.extend(["--model", cli_model])
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"status": "error", "text": "", "error": "grok CLI not found"}
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "text": "", "error": "grok timed out"}
+    finally:
+        if prompt_path:
+            try:
+                os.unlink(prompt_path)
+            except OSError:
+                pass
+
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "")[:300]
+        return {
+            "status": "error",
+            "text": "",
+            "error": f"grok exit {result.returncode}: {err}",
+        }
+    return {"status": "success", "text": _extract_grok_cli_text(result.stdout)}

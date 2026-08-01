@@ -503,6 +503,7 @@ async function agentCommandInternal(
     const skillsSnapshot = needsSkillsSnapshot
       ? buildWorkspaceSkillSnapshot(workspaceDir, {
           config: cfg,
+          agentId: sessionAgentId,
           eligibility: { remote: getRemoteSkillEligibility() },
           snapshotVersion: skillsSnapshotVersion,
           skillFilter,
@@ -510,7 +511,8 @@ async function agentCommandInternal(
       : sessionEntry?.skillsSnapshot;
 
     if (skillsSnapshot && sessionStore && sessionKey && needsSkillsSnapshot) {
-      const current = sessionEntry ?? {
+      const base = isNewSession ? undefined : sessionEntry;
+      const current = base ?? {
         sessionId,
         updatedAt: Date.now(),
       };

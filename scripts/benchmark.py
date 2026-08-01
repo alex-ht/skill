@@ -254,7 +254,7 @@ def _parse_args() -> argparse.Namespace:
             "Judge model or backend. Default (unset): OpenClaw agent session with "
             "openrouter/anthropic/claude-haiku-4.5. Set to a model ID to call its API "
             "directly (e.g. kilo/anthropic/claude-sonnet-4-5, openai/gpt-4o, "
-            "anthropic/claude-sonnet-4-5-20250514, claude)"
+            "anthropic/claude-sonnet-4-5-20250514, claude, grok, grok:grok-4.5)"
         ),
     )
     parser.add_argument(
@@ -890,6 +890,8 @@ def _judge_backend_name(
         return "openai_compat_custom"
     if model == "claude" or model.startswith("claude:"):
         return "claude_cli"
+    if model == "grok" or model.startswith("grok:"):
+        return "grok_cli"
     if model.startswith("anthropic/"):
         return "anthropic"
     if model.startswith("openai/"):
@@ -959,6 +961,13 @@ def _validate_direct_judge_configuration(
         if shutil.which("claude") is None:
             raise ModelValidationError(
                 "Judge backend 'claude' requires the Claude CLI to be installed and available in PATH."
+            )
+        return
+
+    if backend == "grok_cli":
+        if shutil.which("grok") is None:
+            raise ModelValidationError(
+                "Judge backend 'grok' requires the Grok CLI to be installed and available in PATH."
             )
         return
 
