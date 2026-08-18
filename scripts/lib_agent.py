@@ -36,8 +36,18 @@ class ModelValidationError(Exception):
 MAX_OPENCLAW_MESSAGE_CHARS = int(os.environ.get("PINCHBENCH_MAX_MSG_CHARS", "8000"))
 JUDGE_MAX_MSG_CHARS = int(os.environ.get("PINCHBENCH_JUDGE_MAX_MSG_CHARS", "3000"))
 
-# Valid thinking levels for OpenClaw reasoning depth
-VALID_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "adaptive")
+# Valid thinking levels across runtimes. OpenClaw uses `adaptive`; Pi uses `max`.
+VALID_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max")
+OPENCLAW_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "adaptive")
+
+
+def map_openclaw_thinking(level: Optional[str]) -> Optional[str]:
+    """Map a CLI thinking level onto OpenClaw's supported set."""
+    if not level:
+        return None
+    if level == "max":
+        return "adaptive"
+    return level
 
 
 def _coerce_subprocess_output(value: Any) -> str:
@@ -559,15 +569,25 @@ def cleanup_agent_sessions(agent_id: str) -> None:
         logger.info("Removed %s old OpenClaw session transcripts for %s", removed, agent_id)
 
 
-def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: str) -> Path:
+def prepare_task_workspace(
+    skill_dir: Path,
+    run_id: str,
+    task: Task,
+    agent_id: str,
+    workspace: Optional[Path] = None,
+    bootstrap_dirs: Optional[List[Path]] = None,
+) -> Path:
     """
     Prepare workspace for a task by copying fixtures.
     Uses the agent's configured workspace to ensure files are in the right place.
+    Pass ``workspace`` to skip OpenClaw lookup (used by the Pi runtime).
+    ``bootstrap_dirs`` overrides the search order for AGENTS.md and siblings.
     """
     import shutil
 
-    # Get agent's workspace from agent config
-    workspace = _get_agent_workspace(agent_id)
+    # Get agent's workspace from agent config unless the caller already knows it.
+    if workspace is None:
+        workspace = _get_agent_workspace(agent_id)
     if workspace is None:
         # Fallback to the benchmark workspace layout when the agent list is not
         # immediately consistent after creation.
@@ -607,15 +627,22 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
         shutil.rmtree(workspace, onerror=_remove_readonly)
     workspace.mkdir(parents=True, exist_ok=True)
 
-    # Copy latest bootstrap files from main workspace (so AGENTS.md edits take effect immediately)
-    main_workspace = Path.home() / ".openclaw" / "workspace"
+    # Copy latest bootstrap files. Default: OpenClaw workspace, then Pi agent dir.
+    if bootstrap_dirs is None:
+        bootstrap_dirs = [
+            Path.home() / ".openclaw" / "workspace",
+            Path.home() / ".pi" / "agent",
+        ]
     for fname in _BOOTSTRAP_FILES:
-        src = main_workspace / fname
-        if src.exists():
-            (workspace / fname).write_bytes(src.read_bytes())
-            logger.info("Copied latest %s from main workspace", fname)
-        elif fname in saved_bootstrap:
-            # Fallback to previously saved content if main workspace file is missing
+        copied = False
+        for bootstrap_dir in bootstrap_dirs:
+            src = bootstrap_dir / fname
+            if src.exists():
+                (workspace / fname).write_bytes(src.read_bytes())
+                logger.info("Copied latest %s from %s", fname, bootstrap_dir)
+                copied = True
+                break
+        if not copied and fname in saved_bootstrap:
             (workspace / fname).write_bytes(saved_bootstrap[fname])
 
     # Copy workspace_files declared in the task definition
@@ -1193,7 +1220,7 @@ def execute_openclaw_task(
                 if use_local:
                     cmd.insert(2, "--local")
                 if thinking_level:
-                    cmd.extend(["--thinking", thinking_level])
+                    cmd.extend(["--thinking", map_openclaw_thinking(thinking_level)])
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -1233,7 +1260,7 @@ def execute_openclaw_task(
             if use_local:
                 cmd.insert(2, "--local")
             if thinking_level:
-                cmd.extend(["--thinking", thinking_level])
+                cmd.extend(["--thinking", map_openclaw_thinking(thinking_level)])
             result = subprocess.run(
                 cmd,
                 capture_output=True,

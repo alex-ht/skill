@@ -26,6 +26,7 @@ as the source of truth.
 | --- | --- |
 | `scripts/benchmark.py` | CLI entry. Orchestrates load → execute → grade → upload. |
 | `scripts/lib_agent.py` | OpenClaw session, workspace prep, transcripts, fws. |
+| `scripts/lib_pi.py` | Pi coding-agent CLI (`--runtime pi`): JSON mode, transcript conversion. |
 | `scripts/lib_tasks.py` | Parse `task_*.md` + `manifest.yaml`. |
 | `scripts/lib_grading.py` | Automated / LLM-judge / hybrid scoring. |
 | `scripts/lib_upload.py` | Leaderboard token + upload. |
@@ -62,6 +63,10 @@ uv run --extra dev pytest
 ./scripts/run.sh --model openrouter/anthropic/claude-sonnet-4 \
   --suite task_sanity --no-upload
 
+# Same task against Pi (needs `pi` on PATH and provider auth)
+./scripts/run.sh --runtime pi --model openrouter/anthropic/claude-sonnet-4 \
+  --suite task_sanity --no-upload
+
 # Category, core subset, or automated-only
 ./scripts/run.sh --model MODEL --suite coding --no-upload
 ./scripts/run.sh --model MODEL --core --no-upload
@@ -81,8 +86,11 @@ Full operator flags are in `README.md`. Do not duplicate that table here.
    a short unique OpenClaw agent and calls `execute_openclaw_task`.
 3. `prepare_task_workspace` wipes the agent workspace, copies OpenClaw
    bootstrap files, then copies `workspace_files` from `assets/`.
-4. The task prompt (or `sessions:` sequence) is sent with `--local` so
-   dynamically created bench agents skip the gateway.
+4. The task prompt (or `sessions:` sequence) is sent. OpenClaw uses
+   `--local` so dynamically created bench agents skip the gateway.
+   `--runtime pi` instead runs `pi -p --mode json` in the workspace
+   (`scripts/lib_pi.py`) and converts the JSON event stream into the
+   same transcript shape graders already consume.
 5. Transcripts are collected from the agent session store, including
    spawned child sessions. Multi-session steps with `new_session: true`
    reset conversation history; the workspace is never reset.
@@ -172,8 +180,8 @@ agent-visible workspace.
 ## Workspace bootstrap
 
 `prepare_task_workspace` copies, in order of preference, from
-`~/.openclaw/workspace/` then from whatever was already in the agent
-workspace:
+`~/.openclaw/workspace/` then `~/.pi/agent/` (Pi runtime reverses that
+order), then from whatever was already in the agent workspace:
 
 `AGENTS.md`, `SOUL.md`, `BOOTSTRAP.md`, `USER.md`, `IDENTITY.md`,
 `HEARTBEAT.md`, `TOOLS.md`

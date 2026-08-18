@@ -40,6 +40,7 @@ from lib_agent import (
     validate_openrouter_model,
     VALID_THINKING_LEVELS,
 )
+from lib_pi import execute_pi_task, pi_available
 from lib_axiom import init_axiom
 from lib_grading import (
     DEFAULT_JUDGE_TIMEOUT_SECONDS,
@@ -336,10 +337,20 @@ def _parse_args() -> argparse.Namespace:
         help="Clear the judge cache before running",
     )
     parser.add_argument(
+        "--runtime",
+        choices=["openclaw", "pi"],
+        default="openclaw",
+        help="Agent harness: openclaw (default) or pi (https://pi.dev)",
+    )
+    parser.add_argument(
         "--thinking",
         type=str,
         default=None,
-        help="Thinking level for reasoning depth (off, minimal, low, medium, high, xhigh, adaptive)",
+        help=(
+            "Thinking level for reasoning depth "
+            "(off, minimal, low, medium, high, xhigh, adaptive, max). "
+            "adaptive maps to max on --runtime pi; max maps to adaptive on openclaw"
+        ),
     )
     parser.add_argument(
         "--trend",
@@ -1022,6 +1033,17 @@ def main():
         logger.error("Missing required argument: --model (unless using --register or --upload)")
         sys.exit(2)
 
+    if args.runtime == "pi" and not args.register and not args.upload:
+        if not pi_available():
+            logger.error(
+                "pi CLI not found on PATH. Install with: "
+                "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+            )
+            sys.exit(1)
+        logger.info("Runtime: pi")
+    elif not args.register and not args.upload:
+        logger.info("Runtime: openclaw")
+
     if args.register:
         try:
             from lib_upload import UploadError, register_token, save_token_config
@@ -1139,6 +1161,14 @@ def main():
                 args.model,
             )
             sys.exit(1)
+        resume_runtime = resume_data.get("runtime", "openclaw")
+        if resume_runtime != args.runtime:
+            logger.error(
+                "--continue: runtime mismatch (file has '%s', --runtime is '%s')",
+                resume_runtime,
+                args.runtime,
+            )
+            sys.exit(1)
         run_id, tasks_to_run, results, grades_by_task_id = _load_continue_state(
             resume_path, tasks_to_run, runs_per_task
         )
@@ -1171,11 +1201,16 @@ def main():
 
     training_recorder: Optional[TrainingRecorder] = None
     if args.record_train:
-        training_output_path = incremental_dir / f"{run_id}_train.jsonl"
-        training_recorder = TrainingRecorder(training_output_path)
-        training_recorder.start()
-        atexit.register(training_recorder.stop)
-        logger.info("Training JSONL recording enabled: %s", training_output_path)
+        if args.runtime == "pi":
+            logger.warning(
+                "--record-train hooks OpenClaw provider traffic and is ignored for --runtime pi"
+            )
+        else:
+            training_output_path = incremental_dir / f"{run_id}_train.jsonl"
+            training_recorder = TrainingRecorder(training_output_path)
+            training_recorder.start()
+            atexit.register(training_recorder.stop)
+            logger.info("Training JSONL recording enabled: %s", training_output_path)
 
     category_map = runner.task_loader.category_map
     category_order = runner.task_loader.categories
@@ -1206,6 +1241,7 @@ def main():
         cat_scores = _compute_category_scores(grades_by_task_id, tasks_by_id, category_order)
         partial = {
             "model": args.model,
+            "runtime": args.runtime,
             "benchmark_version": _get_benchmark_version(skill_root),
             "run_id": run_id,
             "timestamp": time.time(),
@@ -1364,29 +1400,44 @@ def main():
                 "stderr": "",
             }
             try:
-                ensure_agent_exists(
-                    execution_agent_id,
-                    args.model,
-                    execution_workspace,
-                    base_url=args.base_url,
-                    api_key=args.api_key,
-                    training_recorder=training_recorder,
-                    benchmark_run_id=run_id if training_recorder is not None else None,
-                    task_id=task.task_id if training_recorder is not None else None,
-                    run_index=run_index + 1 if training_recorder is not None else None,
-                )
-                cleanup_agent_sessions(execution_agent_id)
-                result = execute_openclaw_task(
-                    task=task,
-                    agent_id=execution_agent_id,
-                    model_id=args.model,
-                    run_id=execution_run_id,
-                    timeout_multiplier=args.timeout_multiplier,
-                    skill_dir=skill_dir,
-                    output_dir=Path(args.output_dir) / f"{run_id}_transcripts",
-                    verbose=args.verbose,
-                    thinking_level=args.thinking,
-                )
+                if args.runtime == "pi":
+                    result = execute_pi_task(
+                        task=task,
+                        agent_id=execution_agent_id,
+                        model_id=args.model,
+                        run_id=execution_run_id,
+                        timeout_multiplier=args.timeout_multiplier,
+                        skill_dir=skill_dir,
+                        workspace=execution_workspace,
+                        output_dir=Path(args.output_dir) / f"{run_id}_transcripts",
+                        verbose=args.verbose,
+                        thinking_level=args.thinking,
+                        api_key=args.api_key,
+                    )
+                else:
+                    ensure_agent_exists(
+                        execution_agent_id,
+                        args.model,
+                        execution_workspace,
+                        base_url=args.base_url,
+                        api_key=args.api_key,
+                        training_recorder=training_recorder,
+                        benchmark_run_id=run_id if training_recorder is not None else None,
+                        task_id=task.task_id if training_recorder is not None else None,
+                        run_index=run_index + 1 if training_recorder is not None else None,
+                    )
+                    cleanup_agent_sessions(execution_agent_id)
+                    result = execute_openclaw_task(
+                        task=task,
+                        agent_id=execution_agent_id,
+                        model_id=args.model,
+                        run_id=execution_run_id,
+                        timeout_multiplier=args.timeout_multiplier,
+                        skill_dir=skill_dir,
+                        output_dir=Path(args.output_dir) / f"{run_id}_transcripts",
+                        verbose=args.verbose,
+                        thinking_level=args.thinking,
+                    )
             except Exception as exc:
                 execution_error = str(exc)
                 logger.warning("Task execution failed for %s, continuing: %s", task.task_id, exc)
@@ -1589,6 +1640,7 @@ def main():
         cat_scores = _compute_category_scores(grades_by_task_id, tasks_by_id, category_order)
         aggregate = {
             "model": args.model,
+            "runtime": args.runtime,
             "benchmark_version": _get_benchmark_version(skill_root),
             "run_id": run_id,
             "timestamp": time.time(),

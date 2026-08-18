@@ -35,6 +35,9 @@ cd skill
 
 # Or run specific tasks
 ./scripts/run.sh --model openrouter/openai/gpt-4o --suite task_calendar,task_stock
+
+# Run against the Pi coding agent (https://pi.dev) instead of OpenClaw
+./scripts/run.sh --runtime pi --model openrouter/anthropic/claude-sonnet-4 --suite task_sanity --no-upload
 ```
 
 > **Note:** Model IDs must include their provider prefix (e.g. `openrouter/`, `anthropic/`). [OpenRouter](https://openrouter.ai) is the default provider used for routing.
@@ -43,7 +46,8 @@ cd skill
 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/) package manager
-- A running OpenClaw instance
+- A running OpenClaw instance (unless using `--runtime pi`)
+- For `--runtime pi`: the [`pi`](https://pi.dev) CLI on `PATH` (`npm install -g --ignore-scripts @earendil-works/pi-coding-agent`) and provider credentials configured via `pi /login` or env vars
 
 ## What Gets Tested
 
@@ -93,6 +97,7 @@ export PINCHBENCH_OFFICIAL_KEY=your_official_key
 
 | Flag                     | Description                                                                   |
 | ------------------------ | ----------------------------------------------------------------------------- |
+| `--runtime RUNTIME`      | Agent harness: `openclaw` (default) or `pi` (Pi coding agent CLI)             |
 | `--model MODEL`          | Model to test (e.g., `openrouter/anthropic/claude-sonnet-4`)                  |
 | `--judge MODEL`          | Judge model for LLM grading; uses direct API when set (see below)             |
 | `--judge-fallback MODEL` | Fallback judge model used when the primary judge fails all retries            |
@@ -104,7 +109,7 @@ export PINCHBENCH_OFFICIAL_KEY=your_official_key
 | `--suite SUITE`          | `all`, `automated-only`, or comma-separated task IDs                          |
 | `--runs N`               | Number of runs per task for averaging                                         |
 | `--timeout-multiplier N` | Scale timeouts for slower models                                              |
-| `--thinking LEVEL`       | Reasoning depth: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `adaptive` |
+| `--thinking LEVEL`       | Reasoning depth: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `adaptive`, `max` |
 | `--output-dir DIR`       | Where to save results (default: `results/`)                                   |
 | `--record-train`         | Record successful benchmarked-model calls as training JSONL rows              |
 | `--no-upload`            | Skip uploading to leaderboard                                                 |
@@ -112,6 +117,15 @@ export PINCHBENCH_OFFICIAL_KEY=your_official_key
 | `--upload FILE`          | Upload a previous results JSON                                                |
 | `--continue FILE`        | Resume an interrupted run from a partial results JSON (see below)             |
 | `--official-key KEY`     | Mark submission as official (or use `PINCHBENCH_OFFICIAL_KEY` env var)        |
+
+### Pi runtime
+
+`--runtime pi` drives [Pi](https://pi.dev) (`pi -p --mode json`) instead of OpenClaw. The same tasks, fixtures, and graders run; Pi's JSON event stream is converted into the transcript shape automated checks and the LLM judge already understand.
+
+- Model IDs are passed to `pi --model` (provider-prefixed IDs such as `openrouter/anthropic/claude-sonnet-4` work).
+- `--thinking adaptive` maps to Pi's `max`; `--thinking max` maps to OpenClaw's `adaptive`.
+- `--record-train` is OpenClaw-only and is ignored for Pi.
+- Results JSON includes `"runtime": "pi"` so `--continue` cannot mix harnesses.
 
 ### Judge
 
