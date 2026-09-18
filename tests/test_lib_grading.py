@@ -4,6 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,13 +13,20 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from lib_grading import (  # noqa: E402
+    MAX_JUDGE_WORKSPACE_CHARS,
     _combine_grades,
     _compute_cache_key,
+    _grade_llm_judge,
+    _is_context_length_error,
     _normalize_judge_response,
     _parse_judge_response,
     _read_workspace_files,
+    _shrink_judge_inputs,
+    _summarize_transcript,
     GradeResult,
+    clear_judge_cache,
 )
+from lib_tasks import Task  # noqa: E402
 
 
 class JudgeNormalizationTests(unittest.TestCase):
@@ -180,6 +188,183 @@ class WorkspaceFilesForJudgeTests(unittest.TestCase):
         )
 
         self.assertNotEqual(first_key, second_key)
+
+    def test_read_workspace_files_caps_total_content(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            file_body = "X" * 3500
+            for index in range(20):
+                (workspace / f"dump_{index:02d}.txt").write_text(file_body, encoding="utf-8")
+
+            content = _read_workspace_files(str(workspace))
+
+        self.assertLessEqual(len(content), MAX_JUDGE_WORKSPACE_CHARS + 200)
+        self.assertIn("omitted for judge context limit", content)
+
+
+def _make_judge_task() -> Task:
+    return Task(
+        task_id="task_browser_automation",
+        name="Browser",
+        category="coding",
+        grading_type="llm_judge",
+        timeout_seconds=60,
+        workspace_files=[],
+        prompt="Automate the browser",
+        expected_behavior="Complete the workflow",
+        grading_criteria=["quality"],
+        llm_judge_rubric="Score quality from 0 to 1",
+    )
+
+
+def _assistant_transcript(text: str = "done") -> list[dict]:
+    return [
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+            },
+        }
+    ]
+
+
+CONTEXT_OVERFLOW_ERROR = (
+    'HTTP 400: {"error": {"code": "context_length_exceeded", '
+    '"message": "Input tokens exceed the configured limit of 272000 tokens. '
+    'Your messages resulted in 1878242 tokens."}}'
+)
+SUCCESS_JUDGE_TEXT = '{"scores": {"quality": 0.8}, "total": 0.8, "notes": "ok"}'
+
+
+class JudgeFallbackContextLengthTests(unittest.TestCase):
+    def setUp(self) -> None:
+        clear_judge_cache()
+
+    def tearDown(self) -> None:
+        clear_judge_cache()
+
+    def test_is_context_length_error_detects_azure_payload(self) -> None:
+        self.assertTrue(_is_context_length_error(CONTEXT_OVERFLOW_ERROR))
+        self.assertFalse(_is_context_length_error("HTTP 500: internal server error"))
+
+    def test_shrink_judge_inputs_uses_reported_token_limit(self) -> None:
+        transcript = "T" * 80_000
+        workspace = "W" * 20_000
+        shrunk_t, shrunk_w = _shrink_judge_inputs(
+            transcript, workspace, CONTEXT_OVERFLOW_ERROR
+        )
+        self.assertLess(len(shrunk_t) + len(shrunk_w), len(transcript) + len(workspace))
+        self.assertIn("truncated for judge context limit", shrunk_t)
+
+    def test_summarize_transcript_truncates_huge_user_messages(self) -> None:
+        transcript = [
+            {
+                "type": "message",
+                "message": {
+                    "role": "user",
+                    "content": ["U" * 50_000],
+                },
+            }
+        ]
+        summary = _summarize_transcript(transcript)
+        self.assertLess(len(summary), 5_000)
+        self.assertIn("[truncated]", summary)
+
+    def test_context_length_error_skips_retries_and_uses_fallback_model(self) -> None:
+        calls: list[str] = []
+
+        def fake_call_judge_api(**kwargs):
+            calls.append(kwargs["model"])
+            if kwargs["model"] == "gpt-5.4-mini":
+                return {"status": "error", "text": "", "error": CONTEXT_OVERFLOW_ERROR}
+            return {"status": "success", "text": SUCCESS_JUDGE_TEXT}
+
+        with (
+            patch("lib_grading.call_judge_api", side_effect=fake_call_judge_api),
+            patch("lib_grading.time.sleep") as sleep_mock,
+        ):
+            result = _grade_llm_judge(
+                task=_make_judge_task(),
+                execution_result={"transcript": _assistant_transcript(), "status": "success"},
+                judge_model="gpt-5.4-mini",
+                judge_fallback_model="gpt-5.4",
+                judge_agent_prefix="bench-judge",
+                judge_timeout_seconds=30,
+                judge_backend="api",
+            )
+
+        self.assertEqual(calls, ["gpt-5.4-mini", "gpt-5.4"])
+        sleep_mock.assert_not_called()
+        self.assertAlmostEqual(result.score, 0.8)
+
+    def test_context_length_error_shrinks_prompt_when_fallback_also_overflows(self) -> None:
+        prompt_lengths: list[int] = []
+
+        def fake_call_judge_api(**kwargs):
+            prompt_lengths.append(len(kwargs["prompt"]))
+            if len(prompt_lengths) == 1:
+                self.assertEqual(kwargs["model"], "gpt-5.4-mini")
+                return {"status": "error", "text": "", "error": CONTEXT_OVERFLOW_ERROR}
+            if len(prompt_lengths) == 2:
+                self.assertEqual(kwargs["model"], "gpt-5.4")
+                return {
+                    "status": "error",
+                    "text": "",
+                    "error": (
+                        'HTTP 400: {"error": {"code": "context_length_exceeded", '
+                        '"message": "Input tokens exceed the configured limit of 922000 tokens. '
+                        'Your messages resulted in 1878242 tokens."}}'
+                    ),
+                }
+            self.assertEqual(kwargs["model"], "gpt-5.4")
+            return {"status": "success", "text": SUCCESS_JUDGE_TEXT}
+
+        huge_transcript = _assistant_transcript("A" * 20_000)
+        with (
+            patch("lib_grading.call_judge_api", side_effect=fake_call_judge_api),
+            patch("lib_grading.time.sleep"),
+        ):
+            result = _grade_llm_judge(
+                task=_make_judge_task(),
+                execution_result={"transcript": huge_transcript, "status": "success"},
+                judge_model="gpt-5.4-mini",
+                judge_fallback_model="gpt-5.4",
+                judge_agent_prefix="bench-judge",
+                judge_timeout_seconds=30,
+                judge_backend="api",
+            )
+
+        self.assertEqual(len(prompt_lengths), 3)
+        self.assertLess(prompt_lengths[2], prompt_lengths[1])
+        self.assertAlmostEqual(result.score, 0.8)
+
+    def test_non_context_errors_still_retry_before_fallback(self) -> None:
+        calls: list[str] = []
+
+        def fake_call_judge_api(**kwargs):
+            calls.append(kwargs["model"])
+            if kwargs["model"] == "gpt-5.4-mini":
+                return {"status": "error", "text": "", "error": "HTTP 500: boom"}
+            return {"status": "success", "text": SUCCESS_JUDGE_TEXT}
+
+        with (
+            patch("lib_grading.call_judge_api", side_effect=fake_call_judge_api),
+            patch("lib_grading.time.sleep") as sleep_mock,
+        ):
+            result = _grade_llm_judge(
+                task=_make_judge_task(),
+                execution_result={"transcript": _assistant_transcript(), "status": "success"},
+                judge_model="gpt-5.4-mini",
+                judge_fallback_model="gpt-5.4",
+                judge_agent_prefix="bench-judge",
+                judge_timeout_seconds=30,
+                judge_backend="api",
+            )
+
+        self.assertEqual(calls, ["gpt-5.4-mini", "gpt-5.4-mini", "gpt-5.4"])
+        self.assertEqual(sleep_mock.call_count, 1)
+        self.assertAlmostEqual(result.score, 0.8)
 
 
 if __name__ == "__main__":

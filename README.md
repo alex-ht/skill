@@ -95,7 +95,7 @@ export PINCHBENCH_OFFICIAL_KEY=your_official_key
 | ------------------------ | ----------------------------------------------------------------------------- |
 | `--model MODEL`          | Model to test (e.g., `openrouter/anthropic/claude-sonnet-4`)                  |
 | `--judge MODEL`          | Judge model for LLM grading; uses direct API when set (see below)             |
-| `--judge-fallback MODEL` | Fallback judge model used when the primary judge fails all retries            |
+| `--judge-fallback MODEL` | Fallback judge model when the primary judge fails retries or hits context-length limits |
 | `--base-url URL`         | Custom OpenAI-compatible endpoint for the benchmarked agent model             |
 | `--api-key KEY`          | API key for the benchmarked agent custom endpoint                             |
 | `--judge-base-url URL`   | Custom OpenAI-compatible endpoint for the judge model                         |
@@ -148,7 +148,7 @@ By default (no `--judge` flag), the LLM judge runs as an OpenClaw agent session.
   --judge-api-key "$AZURE_OPENAI_API_KEY"
 ```
 
-Use `--judge-fallback` to specify a backup model that is tried automatically when the primary judge fails all retry attempts:
+Use `--judge-fallback` to specify a backup model that is tried automatically when the primary judge fails all retry attempts. Context-length errors skip remaining retries of the same prompt and switch to the fallback immediately; if the fallback still overflows, the judge prompt is shrunk and retried:
 
 ```bash
 ./scripts/run.sh --model openai/gpt-4o \

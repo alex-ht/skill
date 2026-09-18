@@ -15,7 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib import error, request
+from urllib import error, parse, request
 
 from lib_fws import is_fws_task, fws_available, start_fws, stop_fws
 from lib_tasks import Task
@@ -38,6 +38,19 @@ JUDGE_MAX_MSG_CHARS = int(os.environ.get("PINCHBENCH_JUDGE_MAX_MSG_CHARS", "3000
 
 # Valid thinking levels for OpenClaw reasoning depth
 VALID_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "adaptive")
+
+# Tools every newly created OpenClaw agent should have denied by default.
+DEFAULT_DENIED_TOOLS = ("process", "sessions_spawn", "update_plan")
+#DEFAULT_DENIED_TOOLS = ()
+
+# Plugin-owned tools sit outside tools.profile "coding", so they must be named
+# in tools.alsoAllow. OpenClaw expands a plugin id to every tool in that plugin
+# (task-guard -> task_plan/task_mark, tavily -> tavily_search/tavily_extract).
+DEFAULT_ALLOWED_PLUGIN_IDS = ("task-guard", "tavily")
+
+# Show full thinking as a separate "Thinking" message (OpenClaw /reasoning).
+# "on" keeps the complete reasoning payload; "stream" drops it from the final reply.
+DEFAULT_REASONING_VISIBILITY = "on"
 
 
 def _coerce_subprocess_output(value: Any) -> str:
@@ -227,6 +240,109 @@ def _write_openclaw_config(config: Dict[str, Any]) -> None:
     path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+# Env var name passed to openclaw agent processes and stdio MCP servers so they
+# can resolve the dynamic per-run workspace path. Must match the ${WORKDIR}
+# template written into mcp.servers.*.env (see _ensure_mcp_workdir_env_passthrough).
+WORKDIR_ENV_KEY = "WORKDIR"
+WORKDIR_ENV_TEMPLATE = "${WORKDIR}"
+
+
+def _agent_process_env(workspace: Path | str | None = None) -> dict[str, str]:
+    """Build env for openclaw agent processes, tagging the workspace as WORKDIR.
+
+    Stdio MCP children only inherit a small env whitelist plus mcp.servers.*.env.
+    PinchBench therefore sets WORKDIR on the agent process and relies on OpenClaw
+    config substitution (env.WORKDIR: "${WORKDIR}") to forward it into MCP.
+    """
+    env = os.environ.copy()
+    if workspace is not None:
+        env[WORKDIR_ENV_KEY] = str(Path(workspace).resolve())
+    return env
+
+
+def _ensure_mcp_workdir_env_passthrough() -> bool:
+    """Ensure every stdio MCP server passes WORKDIR via ${WORKDIR} substitution.
+
+    Returns True if openclaw.json was modified.
+    """
+    try:
+        config = _load_openclaw_config()
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not load OpenClaw config for MCP WORKDIR passthrough: %s", exc)
+        return False
+
+    servers = config.get("mcp", {}).get("servers")
+    if not isinstance(servers, dict) or not servers:
+        return False
+
+    changed = False
+    for name, server in servers.items():
+        if not isinstance(server, dict):
+            continue
+        # Stdio servers have a command; HTTP/SSE have a url — skip non-stdio.
+        if not server.get("command"):
+            continue
+        env = server.get("env")
+        if not isinstance(env, dict):
+            env = {}
+            server["env"] = env
+        if env.get(WORKDIR_ENV_KEY) == WORKDIR_ENV_TEMPLATE:
+            continue
+        env[WORKDIR_ENV_KEY] = WORKDIR_ENV_TEMPLATE
+        changed = True
+        logger.info(
+            "Configured MCP server %s to pass %s=%s into stdio env",
+            name,
+            WORKDIR_ENV_KEY,
+            WORKDIR_ENV_TEMPLATE,
+        )
+
+    if changed:
+        try:
+            _write_openclaw_config(config)
+        except OSError as exc:
+            logger.warning("Failed to write OpenClaw config for MCP WORKDIR passthrough: %s", exc)
+            return False
+    return changed
+
+
+def _upsert_workspace_env(workspace: Path, key: str, value: str) -> None:
+    """Create or update KEY=value in workspace/.env; preserve other lines."""
+    env_path = workspace / ".env"
+    line = f"{key}={value}"
+    prefix = f"{key}="
+    export_prefix = f"export {prefix}"
+
+    if not env_path.exists():
+        env_path.write_text(line + "\n", encoding="utf-8")
+        return
+
+    try:
+        existing = env_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to read workspace .env %s: %s", env_path, exc)
+        return
+
+    lines = existing.splitlines()
+    out: list[str] = []
+    found = False
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped.startswith(prefix) or stripped.startswith(export_prefix):
+            out.append(line)
+            found = True
+        else:
+            out.append(raw)
+    if not found:
+        if out and out[-1].strip():
+            out.append("")
+        out.append(line)
+    try:
+        env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to write workspace .env %s: %s", env_path, exc)
+
+
 def _resolve_model_ref(model_id: str) -> str | None:
     config = _load_openclaw_config()
     defaults = config.get("agents", {}).get("defaults", {}).get("models", {})
@@ -268,6 +384,163 @@ def _find_agent_entry(config: Dict[str, Any], agent_id: str) -> Dict[str, Any] |
         if entry_id.lower() == normalized_id or entry_name.lower() == normalized_id:
             return entry
     return None
+
+
+def _apply_default_tool_denials(agent_id: str) -> None:
+    """Deny DEFAULT_DENIED_TOOLS on a newly created agent's config entry."""
+    config = _load_openclaw_config()
+    agent_entry = _find_agent_entry(config, agent_id)
+    if agent_entry is None:
+        logger.warning("Agent %s not found in OpenClaw config; skipping tool denials", agent_id)
+        return
+
+    tools = agent_entry.setdefault("tools", {})
+    deny = tools.setdefault("deny", [])
+    changed = False
+    for tool_name in DEFAULT_DENIED_TOOLS:
+        if tool_name not in deny:
+            deny.append(tool_name)
+            changed = True
+
+    if changed:
+        _write_openclaw_config(config)
+        logger.info("Denied default tools %s for agent %s", list(DEFAULT_DENIED_TOOLS), agent_id)
+
+
+def _enabled_plugin_ids(config: Dict[str, Any]) -> list[str]:
+    """Plugin ids that should be alsoAllow'd on coding-profile agents."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for plugin_id in DEFAULT_ALLOWED_PLUGIN_IDS:
+        ids.append(plugin_id)
+        seen.add(plugin_id)
+
+    entries = config.get("plugins", {}).get("entries")
+    if isinstance(entries, dict):
+        for plugin_id, meta in entries.items():
+            if not isinstance(plugin_id, str) or not plugin_id or plugin_id in seen:
+                continue
+            if isinstance(meta, dict) and meta.get("enabled") is False:
+                continue
+            ids.append(plugin_id)
+            seen.add(plugin_id)
+    return ids
+
+
+def _merge_also_allow(tools: Dict[str, Any], plugin_ids: list[str]) -> bool:
+    also_allow = tools.get("alsoAllow")
+    if not isinstance(also_allow, list):
+        tools["alsoAllow"] = list(plugin_ids)
+        return True
+    changed = False
+    for plugin_id in plugin_ids:
+        if plugin_id not in also_allow:
+            also_allow.append(plugin_id)
+            changed = True
+    return changed
+
+
+def _apply_plugin_tool_allowances(agent_id: str | None = None) -> bool:
+    """Expose enabled plugin tools on coding-profile agents via alsoAllow.
+
+    ``tools.profile: coding`` does not include ``group:plugins``. Without an
+    alsoAllow entry (plugin id or tool name), OpenClaw filters out task-guard
+    and tavily tools even when those plugins are loaded and injecting prompts.
+    Returns True if openclaw.json was modified.
+    """
+    try:
+        config = _load_openclaw_config()
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not load OpenClaw config for plugin tool allowances: %s", exc)
+        return False
+
+    plugin_ids = _enabled_plugin_ids(config)
+    changed = False
+
+    global_tools = config.setdefault("tools", {})
+    if not isinstance(global_tools, dict):
+        global_tools = {}
+        config["tools"] = global_tools
+    if _merge_also_allow(global_tools, plugin_ids):
+        changed = True
+
+    if agent_id:
+        agent_entry = _find_agent_entry(config, agent_id)
+        if agent_entry is None:
+            logger.warning(
+                "Agent %s not found in OpenClaw config; skipped per-agent plugin tool allowances",
+                agent_id,
+            )
+        else:
+            agent_tools = agent_entry.setdefault("tools", {})
+            if not isinstance(agent_tools, dict):
+                agent_tools = {}
+                agent_entry["tools"] = agent_tools
+            if _merge_also_allow(agent_tools, plugin_ids):
+                changed = True
+
+    if not changed:
+        return False
+
+    try:
+        _write_openclaw_config(config)
+    except OSError as exc:
+        logger.warning("Failed to write OpenClaw config for plugin tool allowances: %s", exc)
+        return False
+
+    logger.info(
+        "Allowed plugin tools %s%s",
+        plugin_ids,
+        f" for agent {agent_id}" if agent_id else "",
+    )
+    return True
+
+
+def _apply_default_reasoning_visibility(agent_id: str | None = None) -> bool:
+    """Default new workspaces to show full reasoning content.
+
+    Sets ``agents.defaults.reasoningDefault`` and, when *agent_id* is given,
+    that agent's ``reasoningDefault`` to ``DEFAULT_REASONING_VISIBILITY``.
+    Returns True if openclaw.json was modified.
+    """
+    try:
+        config = _load_openclaw_config()
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not load OpenClaw config for reasoning default: %s", exc)
+        return False
+
+    changed = False
+    defaults = config.setdefault("agents", {}).setdefault("defaults", {})
+    if defaults.get("reasoningDefault") != DEFAULT_REASONING_VISIBILITY:
+        defaults["reasoningDefault"] = DEFAULT_REASONING_VISIBILITY
+        changed = True
+
+    if agent_id:
+        agent_entry = _find_agent_entry(config, agent_id)
+        if agent_entry is None:
+            logger.warning(
+                "Agent %s not found in OpenClaw config; skipped per-agent reasoning default",
+                agent_id,
+            )
+        elif agent_entry.get("reasoningDefault") != DEFAULT_REASONING_VISIBILITY:
+            agent_entry["reasoningDefault"] = DEFAULT_REASONING_VISIBILITY
+            changed = True
+
+    if not changed:
+        return False
+
+    try:
+        _write_openclaw_config(config)
+    except OSError as exc:
+        logger.warning("Failed to write OpenClaw config for reasoning default: %s", exc)
+        return False
+
+    logger.info(
+        "Set reasoningDefault=%s%s",
+        DEFAULT_REASONING_VISIBILITY,
+        f" for agent {agent_id}" if agent_id else "",
+    )
+    return True
 
 
 def _configure_recording_provider_for_agent(
@@ -337,6 +610,9 @@ def ensure_agent_exists(
     should_create_agent = True
     agent_recreated = False
 
+    # Make sure stdio MCP servers forward WORKDIR via ${WORKDIR} substitution.
+    _ensure_mcp_workdir_env_passthrough()
+
     try:
         list_result = subprocess.run(
             ["openclaw", "agents", "list"],
@@ -402,6 +678,7 @@ def ensure_agent_exists(
                 text=True,
                 check=False,
                 shell=USE_SHELL,
+                env=_agent_process_env(workspace_dir),
             )
         except FileNotFoundError:
             logger.error("openclaw CLI not found while creating agent")
@@ -411,7 +688,14 @@ def ensure_agent_exists(
             logger.warning(
                 "Agent creation returned %s: %s", create_result.returncode, create_result.stderr
             )
+        else:
+            _apply_default_tool_denials(agent_id)
         agent_recreated = True
+
+    # Workspace/agent sessions should surface full thinking content by default.
+    _apply_default_reasoning_visibility(agent_id)
+    # Coding profile hides plugin tools unless they are alsoAllow'd.
+    _apply_plugin_tool_allowances(agent_id)
 
     bench_agent_dir = _get_agent_store_dir(agent_id) / "agent"
     bench_agent_dir.mkdir(parents=True, exist_ok=True)
@@ -673,6 +957,12 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
                     shutil.rmtree(dest_skill_dir, onerror=_remove_readonly)
                 shutil.copytree(skill_dir_src, dest_skill_dir)
                 logger.info("Copied skill to benchmark workspace: %s", skill_dir_src.name)
+
+    # Record workspace path for tools/exec/debug; MCP still needs process-env
+    # injection + mcp.servers.*.env.WORKDIR=${WORKDIR} (see _agent_process_env).
+    workdir_value = str(workspace.resolve())
+    _upsert_workspace_env(workspace, WORKDIR_ENV_KEY, workdir_value)
+    logger.info("Wrote %s to workspace .env: %s", WORKDIR_ENV_KEY, workdir_value)
 
     return workspace
 
@@ -1127,6 +1417,11 @@ def execute_openclaw_task(
 
     start_time = time.time()
     workspace = prepare_task_workspace(skill_dir, run_id, task, agent_id)
+    # Ensure MCP config passthrough even if ensure_agent_exists was skipped.
+    _ensure_mcp_workdir_env_passthrough()
+    _apply_default_reasoning_visibility(agent_id)
+    agent_env = _agent_process_env(workspace)
+    logger.info("   %s=%s", WORKDIR_ENV_KEY, agent_env.get(WORKDIR_ENV_KEY, ""))
     session_id = f"{task.task_id}_{int(time.time() * 1000)}"
     timeout_seconds = task.timeout_seconds * timeout_multiplier
     stdout = ""
@@ -1202,6 +1497,7 @@ def execute_openclaw_task(
                     timeout=remaining,
                     check=False,
                     shell=USE_SHELL,
+                    env=agent_env,
                 )
                 stdout += result.stdout
                 stderr += result.stderr
@@ -1242,6 +1538,7 @@ def execute_openclaw_task(
                 timeout=timeout_seconds,
                 check=False,
                 shell=USE_SHELL,
+                env=agent_env,
             )
             stdout = result.stdout
             stderr = result.stderr
@@ -1455,6 +1752,7 @@ def run_openclaw_prompt(
                 timeout=remaining,
                 check=False,
                 shell=USE_SHELL,
+                env=_agent_process_env(workspace),
             )
             stdout += result.stdout
             stderr += result.stderr
@@ -1543,6 +1841,86 @@ def call_judge_api(
     return _judge_via_openrouter(prompt, model, timeout_seconds)
 
 
+def _normalize_openai_compat_endpoint(base_url: str) -> str:
+    """Normalize a custom OpenAI-compatible endpoint to /chat/completions.
+
+    Accepts either a full endpoint URL or a base URL such as:
+      - https://host/v1
+      - https://host/openai/v1
+      - https://host/openai/v1/responses  (Azure portal Responses URL; remapped)
+      - https://host/openai/deployments/<deployment>?api-version=...
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        raise ValueError("base_url is required")
+
+    parsed = parse.urlsplit(raw)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/chat/completions"):
+        final_path = path
+    elif path.endswith("/responses"):
+        # Azure AI Foundry portal often copies the Responses API URL.
+        # PinchBench judges use chat completions, so remap it.
+        final_path = path[: -len("/responses")] + "/chat/completions"
+    else:
+        final_path = f"{path}/chat/completions"
+    return parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, final_path, parsed.query, parsed.fragment)
+    )
+
+
+def _normalize_anthropic_compat_endpoint(base_url: str) -> str:
+    """Normalize a custom Anthropic-compatible endpoint to /messages."""
+    raw = (base_url or "").strip()
+    if not raw:
+        raise ValueError("base_url is required")
+
+    parsed = parse.urlsplit(raw)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/messages"):
+        final_path = path
+    else:
+        final_path = f"{path}/messages"
+    return parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, final_path, parsed.query, parsed.fragment)
+    )
+
+
+def _resolve_custom_judge_api_key(
+    base_url: str,
+    api_key: Optional[str],
+    api_format: str = "openai",
+) -> Optional[str]:
+    if api_key:
+        return api_key
+    env_key = os.environ.get("JUDGE_API_KEY")
+    if env_key:
+        return env_key
+    if api_format == "anthropic":
+        return os.environ.get("ANTHROPIC_API_KEY")
+    lowered = base_url.lower()
+    if ".openai.azure.com" in lowered or "azure.com" in lowered:
+        return os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    return os.environ.get("OPENAI_API_KEY")
+
+
+def _openai_compat_auth_headers(endpoint: str, api_key: str) -> Dict[str, str]:
+    """Build auth headers for OpenAI-compatible endpoints.
+
+    Azure OpenAI / Azure AI Foundry expect the ``api-key`` header.
+    Other OpenAI-compatible providers use Bearer tokens.
+    """
+    headers = {"Content-Type": "application/json"}
+    lowered = endpoint.lower()
+    if ".openai.azure.com" in lowered or "azure.com" in lowered:
+        headers["api-key"] = api_key
+        # Many Azure AI Foundry gateways also accept Bearer; set both for compatibility.
+        headers["Authorization"] = f"Bearer {api_key}"
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 def _judge_via_openai_compat(
     prompt: str,
     api_model: str,
@@ -1562,12 +1940,11 @@ def _judge_via_openai_compat(
         "max_completion_tokens": 2048,
     }).encode("utf-8")
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
     if extra_headers:
         headers.update(extra_headers)
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     req = request.Request(endpoint, data=payload, headers=headers, method="POST")
     try:
@@ -1601,10 +1978,30 @@ def _judge_via_openai_compat_custom(
     api_key: str | None,
     timeout_seconds: float,
 ) -> Dict[str, Any]:
-    if not api_key:
-        return {"status": "error", "text": "", "error": "Custom judge API key not set"}
-    endpoint = base_url.rstrip("/") + "/chat/completions"
-    return _judge_via_openai_compat(prompt, model, endpoint, api_key, timeout_seconds)
+    resolved_api_key = _resolve_custom_judge_api_key(base_url, api_key, api_format="openai")
+    if not resolved_api_key:
+        return {
+            "status": "error",
+            "text": "",
+            "error": (
+                "Custom judge endpoint requires an API key. Set JUDGE_API_KEY, "
+                "AZURE_OPENAI_API_KEY, OPENAI_API_KEY, or pass --judge-api-key."
+            ),
+        }
+
+    endpoint = _normalize_openai_compat_endpoint(base_url)
+    # Azure wants the *deployment name* in the model field. Strip common prefixes
+    # so users can pass either a bare deployment id or openai/<deployment>.
+    api_model = model.removeprefix("openai/").removeprefix("openrouter/")
+    logger.info("Custom OpenAI-compat judge endpoint: %s (model=%s)", endpoint, api_model)
+    return _judge_via_openai_compat(
+        prompt,
+        api_model,
+        endpoint,
+        resolved_api_key,
+        timeout_seconds,
+        extra_headers=_openai_compat_auth_headers(endpoint, resolved_api_key),
+    )
 
 
 def _judge_via_anthropic_compat(
@@ -1614,8 +2011,16 @@ def _judge_via_anthropic_compat(
     api_key: str | None,
     timeout_seconds: float,
 ) -> Dict[str, Any]:
-    if not api_key:
-        return {"status": "error", "text": "", "error": "Custom judge API key not set"}
+    resolved_api_key = _resolve_custom_judge_api_key(base_url, api_key, api_format="anthropic")
+    if not resolved_api_key:
+        return {
+            "status": "error",
+            "text": "",
+            "error": (
+                "Custom Anthropic-compatible judge endpoint requires an API key. "
+                "Set JUDGE_API_KEY, ANTHROPIC_API_KEY, or pass --judge-api-key."
+            ),
+        }
     bare_model = model.removeprefix("anthropic/")
     payload = json.dumps({
         "model": bare_model,
@@ -1625,11 +2030,11 @@ def _judge_via_anthropic_compat(
         "messages": [{"role": "user", "content": prompt}],
     }).encode("utf-8")
     headers = {
-        "x-api-key": api_key,
+        "x-api-key": resolved_api_key,
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
     }
-    endpoint = base_url.rstrip("/") + "/messages"
+    endpoint = _normalize_anthropic_compat_endpoint(base_url)
     req = request.Request(endpoint, data=payload, headers=headers, method="POST")
     try:
         with request.urlopen(req, timeout=timeout_seconds) as resp:

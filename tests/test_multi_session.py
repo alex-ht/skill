@@ -108,10 +108,16 @@ class TestNewSessionHandling(unittest.TestCase):
     @patch("lib_agent._archive_transcript")
     @patch("lib_agent.prepare_task_workspace")
     @patch("lib_agent._get_agent_workspace")
+    @patch("lib_agent._ensure_mcp_workdir_env_passthrough")
+    @patch("lib_agent._apply_default_reasoning_visibility")
+    @patch("lib_agent._wait_for_activity_settle")
     @patch("lib_agent.is_fws_task", return_value=False)
     def test_new_session_triggers_archive_and_cleanup(
         self,
         mock_is_fws: MagicMock,
+        mock_settle: MagicMock,
+        mock_reasoning: MagicMock,
+        mock_mcp_passthrough: MagicMock,
         mock_get_ws: MagicMock,
         mock_prepare: MagicMock,
         mock_archive: MagicMock,

@@ -262,7 +262,9 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         metavar="MODEL",
         help=(
-            "Fallback judge model used when the primary --judge model fails all retry attempts. "
+            "Fallback judge model used when the primary --judge model fails all retry attempts, "
+            "or immediately when the judge hits a context-length limit. "
+            "Context overflow also shrinks the prompt and retries. "
             "Accepts the same model ID formats as --judge."
         ),
     )

@@ -25,6 +25,33 @@ DEFAULT_JUDGE_MODEL = "openrouter/anthropic/claude-haiku-4.5"
 DEFAULT_JUDGE_AGENT_PREFIX = "bench-judge"
 DEFAULT_JUDGE_TIMEOUT_SECONDS = 300
 
+# Hard caps so a single judge request cannot balloon into millions of tokens.
+# Per-message / per-file truncation still applies underneath these totals.
+MAX_JUDGE_TRANSCRIPT_CHARS = 120_000
+MAX_JUDGE_WORKSPACE_CHARS = 40_000
+MAX_JUDGE_SHRINK_ROUNDS = 3
+
+_CONTEXT_LENGTH_MARKERS = (
+    "context_length_exceeded",
+    "context length exceeded",
+    "maximum context length",
+    "max context length",
+    "too many tokens",
+    "token limit",
+    "prompt is too long",
+    "prompt too long",
+    "input tokens exceed",
+    "reduce the length of the messages",
+    "please reduce the length",
+    "string too long",
+    "maximum context",
+)
+
+_TOKEN_LIMIT_RE = re.compile(
+    r"limit of (\d+)\s*tokens.*?resulted in (\d+)\s*tokens",
+    re.IGNORECASE | re.DOTALL,
+)
+
 # Judge result cache: maps cache_key -> GradeResult dict
 # Cache key = hash of (task_id, transcript_summary, rubric, judge_model, workspace_content)
 _judge_cache: Dict[str, Dict[str, Any]] = {}
@@ -265,6 +292,66 @@ def _stage_private_image_key(skill_dir: Optional[Path]) -> str:
         return ""
 
 
+def _is_context_length_error(error: Optional[str]) -> bool:
+    """Return True when a judge failure is caused by an oversized prompt."""
+    if not error:
+        return False
+    lowered = error.lower()
+    return any(marker in lowered for marker in _CONTEXT_LENGTH_MARKERS)
+
+
+def _judge_error_text(judge_result: Dict[str, Any]) -> str:
+    parts = [
+        str(judge_result.get("error") or ""),
+        str(judge_result.get("status") or ""),
+        str(judge_result.get("stderr") or ""),
+    ]
+    return " ".join(part for part in parts if part).strip()
+
+
+def _truncate_head_tail(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    marker = "\n\n... [truncated for judge context limit] ...\n\n"
+    if max_chars <= len(marker) + 8:
+        return text[:max_chars]
+    budget = max_chars - len(marker)
+    head = budget // 2
+    tail = budget - head
+    return text[:head] + marker + text[-tail:]
+
+
+def _next_judge_content_budget(transcript: str, workspace: str, error: str) -> int:
+    current = max(1, len(transcript) + len(workspace))
+    ceiling = max(1, int(current * 0.8))
+    target = int(current * 0.4)
+    match = _TOKEN_LIMIT_RE.search(error or "")
+    if match:
+        limit = int(match.group(1))
+        used = int(match.group(2))
+        if used > 0 and limit > 0:
+            target = int(current * (limit * 0.70 / used))
+    return max(1, min(target, ceiling))
+
+
+def _shrink_judge_inputs(
+    transcript: str,
+    workspace: str,
+    error: str,
+) -> tuple[str, str]:
+    """Shrink transcript/workspace so a context-overflowed judge prompt can fit."""
+    budget = _next_judge_content_budget(transcript, workspace, error)
+    total = max(1, len(transcript) + len(workspace))
+    transcript_budget = int(budget * (len(transcript) / total))
+    workspace_budget = budget - transcript_budget
+    return (
+        _truncate_head_tail(transcript, transcript_budget),
+        _truncate_head_tail(workspace, workspace_budget),
+    )
+
+
 def _grade_llm_judge(
     *,
     task: Task,
@@ -345,11 +432,16 @@ def _grade_llm_judge(
     max_judge_attempts = 2
     raw_parsed: Dict[str, Any] = {}
     models_to_try = [m for m in [judge_model, judge_fallback_model] if m]
-    for model_index, active_model in enumerate(models_to_try):
-        if model_index > 0:
+    shrink_rounds = 0
+    last_overflow_error = ""
+    model_index = 0
+    while model_index < len(models_to_try):
+        active_model = models_to_try[model_index]
+        if model_index > 0 and shrink_rounds == 0:
             logger.warning(
                 "Primary judge model failed; retrying with fallback model: %s", active_model
             )
+        overflow = False
         for attempt in range(max_judge_attempts):
             if judge_backend == "api":
                 # Direct API call — bypasses OpenClaw personality injection
@@ -368,6 +460,7 @@ def _grade_llm_judge(
                         logger.info("   [VERBOSE] Judge error: %s", judge_result["error"])
 
                 if judge_result.get("status") != "success":
+                    error_text = _judge_error_text(judge_result)
                     logger.warning(
                         "Judge API call failed (model=%s attempt %d/%d): %s",
                         active_model,
@@ -375,6 +468,14 @@ def _grade_llm_judge(
                         max_judge_attempts,
                         judge_result.get("error", judge_result.get("status")),
                     )
+                    if _is_context_length_error(error_text):
+                        overflow = True
+                        last_overflow_error = error_text
+                        logger.warning(
+                            "Judge context length exceeded (model=%s); skipping remaining retries",
+                            active_model,
+                        )
+                        break
                     if attempt < max_judge_attempts - 1:
                         time.sleep(2**attempt)
                         continue
@@ -398,6 +499,7 @@ def _grade_llm_judge(
                     logger.info("   [VERBOSE] Judge stderr: %s", judge_result.get("stderr", "")[:500])
 
                 if judge_result.get("status") != "success":
+                    error_text = _judge_error_text(judge_result)
                     logger.warning(
                         "Judge execution failed (model=%s attempt %d/%d): %s",
                         active_model,
@@ -405,6 +507,14 @@ def _grade_llm_judge(
                         max_judge_attempts,
                         judge_result.get("status"),
                     )
+                    if _is_context_length_error(error_text):
+                        overflow = True
+                        last_overflow_error = error_text
+                        logger.warning(
+                            "Judge context length exceeded (model=%s); skipping remaining retries",
+                            active_model,
+                        )
+                        break
                     if attempt < max_judge_attempts - 1:
                         time.sleep(2**attempt)
                         continue
@@ -415,6 +525,43 @@ def _grade_llm_judge(
 
         if raw_parsed:
             break  # Got a valid response; no need to try the fallback model
+
+        if overflow:
+            # Prefer a larger-window fallback model with the same prompt first.
+            if model_index + 1 < len(models_to_try):
+                model_index += 1
+                continue
+            if shrink_rounds < MAX_JUDGE_SHRINK_ROUNDS:
+                new_transcript, new_workspace = _shrink_judge_inputs(
+                    transcript_summary,
+                    workspace_content,
+                    last_overflow_error,
+                )
+                if (
+                    new_transcript == transcript_summary
+                    and new_workspace == workspace_content
+                ):
+                    logger.warning(
+                        "Judge prompt cannot shrink further after context overflow"
+                    )
+                    break
+                shrink_rounds += 1
+                transcript_summary = new_transcript
+                workspace_content = new_workspace
+                prompt = _build_judge_prompt(
+                    task, transcript_summary, rubric, workspace_content
+                )
+                logger.warning(
+                    "Retrying judge after shrinking prompt (round %d/%d, "
+                    "transcript=%d chars, workspace=%d chars, model=%s)",
+                    shrink_rounds,
+                    MAX_JUDGE_SHRINK_ROUNDS,
+                    len(transcript_summary),
+                    len(workspace_content),
+                    active_model,
+                )
+                continue
+        model_index += 1
 
     if verbose:
         logger.info("   [VERBOSE] Judge raw response parsed: %s", raw_parsed)
@@ -521,11 +668,14 @@ def _format_grading_criteria(task: Task) -> str:
 
 def _summarize_transcript(transcript: List[Dict[str, Any]]) -> str:
     summary_parts: List[str] = []
+    total_chars = 0
+    truncated = False
     for event in transcript:
         if event.get("type") != "message":
             continue
         msg = event.get("message", {})
         role = msg.get("role")
+        parts_before = len(summary_parts)
         if role == "assistant":
             for item in msg.get("content", []):
                 if item.get("type") == "toolCall":
@@ -549,8 +699,22 @@ def _summarize_transcript(transcript: List[Dict[str, Any]]) -> str:
         elif role == "user":
             content = msg.get("content", [])
             if content:
-                summary_parts.append(f"User: {content[0]}")
-    return "\n".join(summary_parts)
+                user_text = str(content[0])
+                if len(user_text) > 2000:
+                    user_text = user_text[:2000] + "...[truncated]"
+                summary_parts.append(f"User: {user_text}")
+        for part in summary_parts[parts_before:]:
+            total_chars += len(part) + 1
+        if total_chars >= MAX_JUDGE_TRANSCRIPT_CHARS:
+            truncated = True
+            break
+    summary = "\n".join(summary_parts)
+    if len(summary) > MAX_JUDGE_TRANSCRIPT_CHARS:
+        summary = _truncate_head_tail(summary, MAX_JUDGE_TRANSCRIPT_CHARS)
+        truncated = True
+    if truncated and not summary.endswith("[truncated]"):
+        summary += "\n... [transcript truncated for judge context limit] ..."
+    return summary
 
 
 def _read_workspace_files(workspace_path: str) -> str:
@@ -573,6 +737,8 @@ def _read_workspace_files(workspace_path: str) -> str:
     max_chars = 4000
     head_tail_chars = 2000
     file_contents: List[str] = []
+    total_chars = 0
+    omitted = 0
     for f in sorted(workspace.rglob("*")):
         if not f.is_file():
             continue
@@ -590,9 +756,18 @@ def _read_workspace_files(workspace_path: str) -> str:
                     "\n\n... [truncated, showing first 2000 and last 2000 characters] ...\n\n"
                     f"{content[-head_tail_chars:]}"
                 )
-            file_contents.append(f"### File: {rel}\n{content}")
+            entry = f"### File: {rel}\n{content}"
+            if total_chars + len(entry) > MAX_JUDGE_WORKSPACE_CHARS:
+                omitted += 1
+                continue
+            file_contents.append(entry)
+            total_chars += len(entry)
         except (OSError, UnicodeDecodeError):
             pass
+    if omitted:
+        file_contents.append(
+            f"... [{omitted} additional workspace file(s) omitted for judge context limit] ..."
+        )
     return "\n\n".join(file_contents)
 
 
