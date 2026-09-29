@@ -79,6 +79,11 @@ Full operator flags are in `README.md`. Do not duplicate that table here.
    `task_sanity`) is prepended; remaining tasks follow category order.
 2. For each selected task (and each `--runs` iteration) the runner creates
    a short unique OpenClaw agent and calls `execute_openclaw_task`.
+   Auto-created agents, including the judge, deny `process`,
+   `sessions_spawn`, `update_plan`, and tavily (`tavily`, `tavily_search`,
+   `tavily_extract`). Their `alsoAllow` whitelist includes built-in
+   `web_search` and `web_fetch` plus `task-guard`. The tavily plugin entry
+   is set to disabled. The interactive `main` agent entry is left unchanged.
 3. `prepare_task_workspace` wipes the agent workspace, copies OpenClaw
    bootstrap files, then copies `workspace_files` from `assets/`.
 4. The task prompt (or `sessions:` sequence) is sent with `--local` so

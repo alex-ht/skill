@@ -39,14 +39,37 @@ JUDGE_MAX_MSG_CHARS = int(os.environ.get("PINCHBENCH_JUDGE_MAX_MSG_CHARS", "3000
 # Valid thinking levels for OpenClaw reasoning depth
 VALID_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "adaptive")
 
-# Tools every newly created OpenClaw agent should have denied by default.
-DEFAULT_DENIED_TOOLS = ("process", "sessions_spawn", "update_plan")
-#DEFAULT_DENIED_TOOLS = ()
+# Tavily stays off. A plugin id in alsoAllow expands to that plugin's tools,
+# and deny wins, so the id and both tool names are denied and stripped.
+TAVILY_TOOL_IDS = (
+    "tavily",
+    "tavily_search",
+    "tavily_extract",
+)
+DISABLED_PLUGIN_IDS = ("tavily",)
+
+# Tools every bench and judge agent should have denied.
+# Coding profile includes built-ins and excludes plugin tools, so the denylist
+# and alsoAllow are both required.
+DEFAULT_DENIED_TOOLS = (
+    "process",
+    "sessions_spawn",
+    "update_plan",
+    *TAVILY_TOOL_IDS,
+)
+
+# Built-in web tools. Coding profile already includes group:web, but older
+# bench agents denied these names. Keep them on alsoAllow and strip them from
+# deny (deny wins) so web_search / web_fetch stay callable.
+DEFAULT_ALLOWED_TOOLS = (
+    "web_search",
+    "web_fetch",
+)
 
 # Plugin-owned tools sit outside tools.profile "coding", so they must be named
 # in tools.alsoAllow. OpenClaw expands a plugin id to every tool in that plugin
-# (task-guard -> task_plan/task_mark, tavily -> tavily_search/tavily_extract).
-DEFAULT_ALLOWED_PLUGIN_IDS = ("task-guard", "tavily")
+# (task-guard -> task_plan/task_mark).
+DEFAULT_ALLOWED_PLUGIN_IDS = ("task-guard",)
 
 # Show full thinking as a separate "Thinking" message (OpenClaw /reasoning).
 # "on" keeps the complete reasoning payload; "stream" drops it from the final reply.
@@ -387,7 +410,12 @@ def _find_agent_entry(config: Dict[str, Any], agent_id: str) -> Dict[str, Any] |
 
 
 def _apply_default_tool_denials(agent_id: str) -> None:
-    """Deny DEFAULT_DENIED_TOOLS on a newly created agent's config entry."""
+    """Merge DEFAULT_DENIED_TOOLS into one agent's config entry.
+
+    Runs on every ``ensure_agent_exists`` pass, including agents that already
+    exist. Call it after tools are copied from ``main``: that copy replaces
+    the whole ``tools`` object and would otherwise drop these denials.
+    """
     config = _load_openclaw_config()
     agent_entry = _find_agent_entry(config, agent_id)
     if agent_entry is None:
@@ -395,12 +423,20 @@ def _apply_default_tool_denials(agent_id: str) -> None:
         return
 
     tools = agent_entry.setdefault("tools", {})
+    if not isinstance(tools, dict):
+        tools = {}
+        agent_entry["tools"] = tools
     deny = tools.setdefault("deny", [])
+    if not isinstance(deny, list):
+        deny = []
+        tools["deny"] = deny
     changed = False
     for tool_name in DEFAULT_DENIED_TOOLS:
         if tool_name not in deny:
             deny.append(tool_name)
             changed = True
+    if _drop_allowed_tools_from_deny(tools):
+        changed = True
 
     if changed:
         _write_openclaw_config(config)
@@ -420,11 +456,67 @@ def _enabled_plugin_ids(config: Dict[str, Any]) -> list[str]:
         for plugin_id, meta in entries.items():
             if not isinstance(plugin_id, str) or not plugin_id or plugin_id in seen:
                 continue
+            if plugin_id in DISABLED_PLUGIN_IDS:
+                continue
             if isinstance(meta, dict) and meta.get("enabled") is False:
                 continue
             ids.append(plugin_id)
             seen.add(plugin_id)
     return ids
+
+
+def _drop_allowed_tools_from_deny(tools: Dict[str, Any]) -> bool:
+    """Remove whitelisted built-ins from deny. OpenClaw deny wins over alsoAllow."""
+    deny = tools.get("deny")
+    if not isinstance(deny, list):
+        return False
+    kept = [name for name in deny if name not in DEFAULT_ALLOWED_TOOLS]
+    if kept == deny:
+        return False
+    tools["deny"] = kept
+    return True
+
+
+def _default_also_allow_ids(config: Dict[str, Any]) -> list[str]:
+    """Plugin ids plus built-in tools that bench agents must be able to call."""
+    allow_ids = _enabled_plugin_ids(config)
+    for tool_name in DEFAULT_ALLOWED_TOOLS:
+        if tool_name not in allow_ids:
+            allow_ids.append(tool_name)
+    return allow_ids
+
+
+def _drop_also_allow_names(tools: Dict[str, Any], names: tuple[str, ...]) -> bool:
+    """Remove names from alsoAllow. A plugin id there expands to its tools."""
+    also_allow = tools.get("alsoAllow")
+    if not isinstance(also_allow, list):
+        return False
+    blocked = set(names)
+    kept = [name for name in also_allow if name not in blocked]
+    if kept == also_allow:
+        return False
+    tools["alsoAllow"] = kept
+    return True
+
+
+def _disable_plugin_entry(config: Dict[str, Any], plugin_id: str) -> bool:
+    """Set plugins.entries.<id>.enabled to false."""
+    plugins = config.setdefault("plugins", {})
+    if not isinstance(plugins, dict):
+        plugins = {}
+        config["plugins"] = plugins
+    entries = plugins.setdefault("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+        plugins["entries"] = entries
+    meta = entries.get(plugin_id)
+    if not isinstance(meta, dict):
+        entries[plugin_id] = {"enabled": False}
+        return True
+    if meta.get("enabled") is False:
+        return False
+    meta["enabled"] = False
+    return True
 
 
 def _merge_also_allow(tools: Dict[str, Any], plugin_ids: list[str]) -> bool:
@@ -445,7 +537,8 @@ def _apply_plugin_tool_allowances(agent_id: str | None = None) -> bool:
 
     ``tools.profile: coding`` does not include ``group:plugins``. Without an
     alsoAllow entry (plugin id or tool name), OpenClaw filters out task-guard
-    and tavily tools even when those plugins are loaded and injecting prompts.
+    tools even when that plugin is loaded and injecting prompts. Tavily is
+    removed from alsoAllow and its plugin entry is disabled.
     Returns True if openclaw.json was modified.
     """
     try:
@@ -454,14 +547,20 @@ def _apply_plugin_tool_allowances(agent_id: str | None = None) -> bool:
         logger.warning("Could not load OpenClaw config for plugin tool allowances: %s", exc)
         return False
 
-    plugin_ids = _enabled_plugin_ids(config)
+    allow_ids = _default_also_allow_ids(config)
     changed = False
 
     global_tools = config.setdefault("tools", {})
     if not isinstance(global_tools, dict):
         global_tools = {}
         config["tools"] = global_tools
-    if _merge_also_allow(global_tools, plugin_ids):
+    if _merge_also_allow(global_tools, allow_ids):
+        changed = True
+    if _drop_also_allow_names(global_tools, TAVILY_TOOL_IDS):
+        changed = True
+    if _drop_allowed_tools_from_deny(global_tools):
+        changed = True
+    if _disable_plugin_entry(config, "tavily"):
         changed = True
 
     if agent_id:
@@ -476,7 +575,11 @@ def _apply_plugin_tool_allowances(agent_id: str | None = None) -> bool:
             if not isinstance(agent_tools, dict):
                 agent_tools = {}
                 agent_entry["tools"] = agent_tools
-            if _merge_also_allow(agent_tools, plugin_ids):
+            if _merge_also_allow(agent_tools, allow_ids):
+                changed = True
+            if _drop_also_allow_names(agent_tools, TAVILY_TOOL_IDS):
+                changed = True
+            if _drop_allowed_tools_from_deny(agent_tools):
                 changed = True
 
     if not changed:
@@ -490,7 +593,7 @@ def _apply_plugin_tool_allowances(agent_id: str | None = None) -> bool:
 
     logger.info(
         "Allowed plugin tools %s%s",
-        plugin_ids,
+        allow_ids,
         f" for agent {agent_id}" if agent_id else "",
     )
     return True
@@ -688,14 +791,10 @@ def ensure_agent_exists(
             logger.warning(
                 "Agent creation returned %s: %s", create_result.returncode, create_result.stderr
             )
-        else:
-            _apply_default_tool_denials(agent_id)
         agent_recreated = True
 
     # Workspace/agent sessions should surface full thinking content by default.
     _apply_default_reasoning_visibility(agent_id)
-    # Coding profile hides plugin tools unless they are alsoAllow'd.
-    _apply_plugin_tool_allowances(agent_id)
 
     bench_agent_dir = _get_agent_store_dir(agent_id) / "agent"
     bench_agent_dir.mkdir(parents=True, exist_ok=True)
@@ -765,6 +864,12 @@ def ensure_agent_exists(
                 logger.info("Copied tools/skills config from main to bench agent %s", agent_id)
     except Exception as exc:
         logger.warning("Failed to copy full tools/skills settings for bench agent %s: %s", agent_id, exc)
+
+    # The main-tools copy replaces ``tools`` wholesale. Re-merge denials and
+    # alsoAllow afterwards so web_search/web_fetch stay on the allowlist,
+    # task-guard stays visible, and tavily stays denied.
+    _apply_default_tool_denials(agent_id)
+    _apply_plugin_tool_allowances(agent_id)
 
     if (
         training_recorder is not None
