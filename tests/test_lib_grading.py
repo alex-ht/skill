@@ -13,6 +13,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from lib_grading import (  # noqa: E402
+    MAX_JUDGE_TOOL_RESULT_CHARS,
     MAX_JUDGE_WORKSPACE_CHARS,
     _combine_grades,
     _compute_cache_key,
@@ -171,6 +172,17 @@ class WorkspaceFilesForJudgeTests(unittest.TestCase):
         self.assertIn("TAIL_MARKER", content)
         self.assertIn(long_content, content)
 
+    def test_read_workspace_files_keeps_file_over_old_4000_char_cut(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            long_content = ("HEAD " + ("A" * 6000) + " TAIL_MARKER")
+            (workspace / "oss_alternatives.md").write_text(long_content, encoding="utf-8")
+
+            content = _read_workspace_files(str(workspace))
+
+        self.assertIn(long_content, content)
+        self.assertNotIn("showing first 2000", content)
+
     def test_compute_cache_key_changes_when_workspace_content_changes(self) -> None:
         first_key = _compute_cache_key(
             "task_report",
@@ -193,7 +205,9 @@ class WorkspaceFilesForJudgeTests(unittest.TestCase):
         with TemporaryDirectory() as tmp_dir:
             workspace = Path(tmp_dir)
             file_body = "X" * 3500
-            for index in range(20):
+            entry_len = len("### File: dump_00.txt\n") + len(file_body)
+            count = (MAX_JUDGE_WORKSPACE_CHARS // entry_len) + 5
+            for index in range(count):
                 (workspace / f"dump_{index:02d}.txt").write_text(file_body, encoding="utf-8")
 
             content = _read_workspace_files(str(workspace))
@@ -256,6 +270,52 @@ class JudgeFallbackContextLengthTests(unittest.TestCase):
         )
         self.assertLess(len(shrunk_t) + len(shrunk_w), len(transcript) + len(workspace))
         self.assertIn("truncated for judge context limit", shrunk_t)
+
+    def test_summarize_transcript_keeps_tool_result_body(self) -> None:
+        body = "odds Yes 56% / No 44% from the fetched page. " + ("x" * 500)
+        huge = "y" * (MAX_JUDGE_TOOL_RESULT_CHARS + 500)
+        transcript = [
+            {
+                "type": "message",
+                "message": {
+                    "role": "toolResult",
+                    "content": [{"type": "text", "text": body}],
+                },
+            },
+            {
+                "type": "message",
+                "message": {
+                    "role": "toolResult",
+                    "content": [{"type": "text", "text": huge}],
+                },
+            },
+        ]
+        summary = _summarize_transcript(transcript)
+        self.assertIn("Yes 56% / No 44%", summary)
+        self.assertLess(len(summary), MAX_JUDGE_TOOL_RESULT_CHARS * 2 + 100)
+        self.assertIn("[truncated]", summary)
+
+    def test_summarize_transcript_keeps_long_tool_arguments(self) -> None:
+        command = "cat << 'EOF' > oss_alternatives.md " + ("A" * 2500) + " TAIL_MARKER"
+        transcript = [
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "toolCall",
+                            "name": "exec",
+                            "arguments": {"command": command},
+                        }
+                    ],
+                },
+            }
+        ]
+        summary = _summarize_transcript(transcript)
+        self.assertIn("TAIL_MARKER", summary)
+        self.assertIn("A" * 2500, summary)
+        self.assertNotIn("...[truncated]", summary)
 
     def test_summarize_transcript_truncates_huge_user_messages(self) -> None:
         transcript = [

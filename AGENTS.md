@@ -180,8 +180,11 @@ agent-visible workspace.
 `~/.openclaw/workspace/` then from whatever was already in the agent
 workspace:
 
-`AGENTS.md`, `SOUL.md`, `BOOTSTRAP.md`, `USER.md`, `IDENTITY.md`,
-`HEARTBEAT.md`, `TOOLS.md`
+`AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `HEARTBEAT.md`, `TOOLS.md`
+
+`BOOTSTRAP.md` is not restored from the agent workspace. `openclaw agents add`
+seeds that file as a first-run ritual. It is copied only when
+`~/.openclaw/workspace/BOOTSTRAP.md` itself exists.
 
 That **host** `AGENTS.md` is the operating manual for the *benchmarked*
 OpenClaw agent. Changing it changes every subsequent local run. Do not
@@ -203,8 +206,8 @@ Judge sessions delete `BOOTSTRAP.md`, `SOUL.md`, `USER.md`,
 - Official submissions need `PINCHBENCH_OFFICIAL_KEY` / `--official-key`.
   Never commit tokens or official keys.
 - Training capture (`--record-train`) records successful **benchmarked**
-  model calls only (`openai-completions` / `anthropic-messages`). Judge
-  calls are excluded.
+  model calls only (`openai-completions` / `anthropic-messages`, including
+  bundled OpenRouter). Judge calls are excluded.
 - `task_git_rescue_recovery` assumes unsigned commits in the fixture;
   do not re-enable GPG signing in that asset.
 

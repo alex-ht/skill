@@ -13,8 +13,9 @@ import stat
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from urllib import error, parse, request
 
 from lib_fws import is_fws_task, fws_available, start_fws, stop_fws
@@ -55,6 +56,10 @@ DEFAULT_DENIED_TOOLS = (
     "process",
     "sessions_spawn",
     "update_plan",
+#    "write",
+#    "edit",
+#    "web_search",
+#    "web_fetch",
     *TAVILY_TOOL_IDS,
 )
 
@@ -646,6 +651,210 @@ def _apply_default_reasoning_visibility(agent_id: str | None = None) -> bool:
     return True
 
 
+OPENROUTER_PROVIDER_ID = "openrouter"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
+OPENROUTER_DEFAULT_CONTEXT_WINDOW = 200_000
+OPENROUTER_DEFAULT_MAX_TOKENS = 8192
+
+
+@dataclass(frozen=True)
+class RecordingProviderResolution:
+    """Recordable provider for one benchmarked model, or why recording was skipped."""
+
+    provider_name: str
+    model_id: str
+    provider: Optional[Dict[str, Any]] = None
+    skip_reason: Optional[str] = None
+
+
+def normalize_openrouter_model_id(model_suffix: str) -> str:
+    """Match OpenClaw: a slash-free OpenRouter suffix is stored as ``openrouter/<id>``."""
+    trimmed = model_suffix.strip()
+    if trimmed and "/" not in trimmed:
+        return f"openrouter/{trimmed}"
+    return trimmed
+
+
+def _openrouter_auth_profile_key(auth_profiles_path: Path) -> Optional[str]:
+    if not auth_profiles_path.is_file():
+        return None
+    try:
+        data = json.loads(auth_profiles_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not read OpenRouter auth profiles at %s", auth_profiles_path)
+        return None
+    profiles = data.get("profiles") if isinstance(data, dict) else None
+    if not isinstance(profiles, dict):
+        return None
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        if profile.get("provider") != OPENROUTER_PROVIDER_ID or profile.get("type") != "api_key":
+            continue
+        key = profile.get("key")
+        if isinstance(key, str) and key.strip():
+            return key.strip()
+    return None
+
+
+def _load_openrouter_model_capabilities(model_id: str, cache_path: Path) -> Dict[str, Any]:
+    fallback: Dict[str, Any] = {
+        "name": model_id,
+        "reasoning": False,
+        "input": ["text"],
+        "contextWindow": OPENROUTER_DEFAULT_CONTEXT_WINDOW,
+        "maxTokens": OPENROUTER_DEFAULT_MAX_TOKENS,
+    }
+    if not cache_path.is_file():
+        return fallback
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not read OpenRouter model cache at %s", cache_path)
+        return fallback
+    models = payload.get("models") if isinstance(payload, dict) else None
+    entry = models.get(model_id) if isinstance(models, dict) else None
+    if not isinstance(entry, dict):
+        return fallback
+
+    resolved = dict(fallback)
+    name = entry.get("name")
+    if isinstance(name, str) and name.strip():
+        resolved["name"] = name
+    if isinstance(entry.get("reasoning"), bool):
+        resolved["reasoning"] = entry["reasoning"]
+    inputs = entry.get("input")
+    if isinstance(inputs, list) and inputs:
+        resolved["input"] = inputs
+    context_window = entry.get("contextWindow")
+    if isinstance(context_window, int) and context_window > 0:
+        resolved["contextWindow"] = context_window
+    max_tokens = entry.get("maxTokens")
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        resolved["maxTokens"] = max_tokens
+    cost = entry.get("cost")
+    if isinstance(cost, dict):
+        resolved["cost"] = cost
+    return resolved
+
+
+def build_openrouter_recording_provider(
+    model_id: str,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    auth_profiles_path: Optional[Path] = None,
+    cache_path: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Synthetic openai-completions provider that proxies one OpenRouter model.
+
+    Returns None when neither the main agent's OpenRouter API-key profile nor
+    ``OPENROUTER_API_KEY`` is available. The profile wins, matching OpenClaw's
+    own auth order: an expired environment variable must not override a live
+    profile. The env marker is stored instead of the environment value.
+    """
+    profile_path = (
+        Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
+        if auth_profiles_path is None
+        else auth_profiles_path
+    )
+    api_key = _openrouter_auth_profile_key(profile_path)
+    if not api_key:
+        env_map: Mapping[str, str] = os.environ if env is None else env
+        if str(env_map.get(OPENROUTER_API_KEY_ENV) or "").strip():
+            api_key = OPENROUTER_API_KEY_ENV
+    if not api_key:
+        return None
+
+    catalog_path = (
+        Path.home() / ".openclaw" / "cache" / "openrouter-models.json"
+        if cache_path is None
+        else cache_path
+    )
+    caps = _load_openrouter_model_capabilities(model_id, catalog_path)
+    model_entry: Dict[str, Any] = {
+        "id": model_id,
+        "name": caps["name"],
+        "reasoning": caps["reasoning"],
+        "input": caps["input"],
+        "contextWindow": caps["contextWindow"],
+        "maxTokens": caps["maxTokens"],
+        "compat": {"thinkingFormat": "openrouter"},
+    }
+    if "cost" in caps:
+        model_entry["cost"] = caps["cost"]
+    return {
+        "baseUrl": OPENROUTER_BASE_URL,
+        "api": "openai-completions",
+        "apiKey": api_key,
+        "models": [model_entry],
+    }
+
+
+def resolve_recording_provider(
+    resolved_model_ref: str,
+    providers: Mapping[str, Any],
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    auth_profiles_path: Optional[Path] = None,
+    cache_path: Optional[Path] = None,
+) -> RecordingProviderResolution:
+    """Resolve the provider config ``--record-train`` should proxy.
+
+    Configured providers win. Bundled OpenRouter is synthesized when it is
+    absent from ``models.providers``, because OpenClaw ships it as a plugin.
+    """
+    if "/" not in resolved_model_ref:
+        return RecordingProviderResolution(
+            provider_name="",
+            model_id=resolved_model_ref,
+            skip_reason=f"model ref {resolved_model_ref!r} has no provider",
+        )
+
+    provider_name, model_suffix = resolved_model_ref.split("/", 1)
+    configured = providers.get(provider_name)
+    if isinstance(configured, dict):
+        api = configured.get("api")
+        api_name = api if isinstance(api, str) else None
+        if supports_recording_api(api_name):
+            return RecordingProviderResolution(
+                provider_name=provider_name,
+                model_id=model_suffix,
+                provider=configured,
+            )
+        return RecordingProviderResolution(
+            provider_name=provider_name,
+            model_id=model_suffix,
+            skip_reason=f"provider API {api_name} is not recordable",
+        )
+
+    if provider_name == OPENROUTER_PROVIDER_ID:
+        model_id = normalize_openrouter_model_id(model_suffix)
+        provider = build_openrouter_recording_provider(
+            model_id,
+            env=env,
+            auth_profiles_path=auth_profiles_path,
+            cache_path=cache_path,
+        )
+        if provider is None:
+            return RecordingProviderResolution(
+                provider_name=provider_name,
+                model_id=model_id,
+                skip_reason="OpenRouter credentials are not available",
+            )
+        return RecordingProviderResolution(
+            provider_name=provider_name,
+            model_id=model_id,
+            provider=provider,
+        )
+
+    return RecordingProviderResolution(
+        provider_name=provider_name,
+        model_id=model_suffix,
+        skip_reason=f"provider {provider_name} is not configured",
+    )
+
+
 def _configure_recording_provider_for_agent(
     *,
     agent_id: str,
@@ -878,24 +1087,24 @@ def ensure_agent_exists(
         and run_index is not None
         and resolved_model_ref
     ):
-        selected_provider_name, selected_model_name = resolved_model_ref.split("/", 1)
-        selected_provider = _load_openclaw_config().get("models", {}).get("providers", {}).get(
-            selected_provider_name
-        )
-        selected_api = selected_provider.get("api") if isinstance(selected_provider, dict) else None
-        if selected_provider and supports_recording_api(selected_api):
+        providers = _load_openclaw_config().get("models", {}).get("providers", {})
+        if not isinstance(providers, dict):
+            providers = {}
+        resolution = resolve_recording_provider(resolved_model_ref, providers)
+        selected_provider = resolution.provider
+        if selected_provider is not None:
             proxy_base_url = training_recorder.register_execution(
                 benchmark_run_id=benchmark_run_id,
                 task_id=task_id,
                 run_index=run_index,
-                api=selected_api,
+                api=str(selected_provider.get("api", "")),
                 upstream_base_url=str(selected_provider.get("baseUrl", "")),
             )
             _configure_recording_provider_for_agent(
                 agent_id=agent_id,
-                selected_provider_name=selected_provider_name,
+                selected_provider_name=resolution.provider_name,
                 selected_provider=selected_provider,
-                model_id=selected_model_name,
+                model_id=resolution.model_id,
                 proxy_base_url=proxy_base_url,
                 model_alias=model_id,
             )
@@ -905,11 +1114,11 @@ def ensure_agent_exists(
                 run_index,
                 proxy_base_url,
             )
-        elif selected_provider:
+        else:
             logger.warning(
-                "Training recorder does not support provider API %s for model %s",
-                selected_api,
+                "Training recorder skipped %s: %s",
                 resolved_model_ref,
+                resolution.skip_reason,
             )
 
     bench_sessions_dir = _get_agent_store_dir(agent_id) / "sessions"
@@ -978,7 +1187,18 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
             logger.warning("Could not find agent workspace, using legacy fallback")
             workspace = Path(f"/tmp/pinchbench/{run_id}/{task.task_id}")
 
-    _BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "BOOTSTRAP.md", "USER.md", "IDENTITY.md", "HEARTBEAT.md", "TOOLS.md"]
+    # openclaw agents add seeds BOOTSTRAP.md into every new workspace as a
+    # first-run ritual. Do not snapshot or restore that seed. Copy it only when
+    # ~/.openclaw/workspace/BOOTSTRAP.md itself exists.
+    _BOOTSTRAP_FILES = [
+        "AGENTS.md",
+        "SOUL.md",
+        "USER.md",
+        "IDENTITY.md",
+        "HEARTBEAT.md",
+        "TOOLS.md",
+    ]
+    _MAIN_ONLY_FILES = ["BOOTSTRAP.md"]
 
     def _remove_readonly(func, path, _):
         try:
@@ -998,7 +1218,7 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
 
     # Copy latest bootstrap files from main workspace (so AGENTS.md edits take effect immediately)
     main_workspace = Path.home() / ".openclaw" / "workspace"
-    for fname in _BOOTSTRAP_FILES:
+    for fname in _BOOTSTRAP_FILES + _MAIN_ONLY_FILES:
         src = main_workspace / fname
         if src.exists():
             (workspace / fname).write_bytes(src.read_bytes())

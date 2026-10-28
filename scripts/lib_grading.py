@@ -26,9 +26,15 @@ DEFAULT_JUDGE_AGENT_PREFIX = "bench-judge"
 DEFAULT_JUDGE_TIMEOUT_SECONDS = 300
 
 # Hard caps so a single judge request cannot balloon into millions of tokens.
-# Per-message / per-file truncation still applies underneath these totals.
-MAX_JUDGE_TRANSCRIPT_CHARS = 120_000
-MAX_JUDGE_WORKSPACE_CHARS = 40_000
+# Tool results, assistant text, and user text are still shortened per message.
+# Tool-call arguments and each workspace file are sent whole until these totals.
+MAX_JUDGE_TRANSCRIPT_CHARS = 240_000
+MAX_JUDGE_WORKSPACE_CHARS = 80_000
+# A tool result under this length is sent whole. 200 chars stopped at the JSON
+# wrapper, so the judge never saw the page or search summary it was scoring.
+MAX_JUDGE_TOOL_RESULT_CHARS = 16_000
+MAX_JUDGE_ASSISTANT_TEXT_CHARS = 4_000
+MAX_JUDGE_USER_TEXT_CHARS = 4_000
 MAX_JUDGE_SHRINK_ROUNDS = 3
 
 _CONTEXT_LENGTH_MARKERS = (
@@ -666,6 +672,15 @@ def _format_grading_criteria(task: Task) -> str:
     return "\n".join(f"- {criterion}" for criterion in task.grading_criteria)
 
 
+def _tool_result_text(item: Any) -> str:
+    """Return the readable body of one tool-result content part."""
+    if isinstance(item, dict):
+        text = item.get("text")
+        if isinstance(text, str):
+            return text
+    return str(item)
+
+
 def _summarize_transcript(transcript: List[Dict[str, Any]]) -> str:
     summary_parts: List[str] = []
     total_chars = 0
@@ -680,28 +695,24 @@ def _summarize_transcript(transcript: List[Dict[str, Any]]) -> str:
             for item in msg.get("content", []):
                 if item.get("type") == "toolCall":
                     args = item.get("arguments", {})
-                    truncated_args: Dict[str, Any] = {}
-                    for k, v in args.items():
-                        if isinstance(v, str) and len(v) > 200:
-                            truncated_args[k] = v[:200] + "...[truncated]"
-                        else:
-                            truncated_args[k] = v
-                    summary_parts.append(f"Tool: {item.get('name')}({json.dumps(truncated_args)})")
+                    summary_parts.append(f"Tool: {item.get('name')}({json.dumps(args)})")
                 elif item.get("type") == "text":
                     text = item.get("text", "").strip()
                     if text:
-                        summary_parts.append(f"Assistant: {text[:2000]}")
+                        summary_parts.append(f"Assistant: {text[:MAX_JUDGE_ASSISTANT_TEXT_CHARS]}")
         elif role == "toolResult":
             content = msg.get("content", [])
             if content:
-                result_preview = str(content[0])[:200]
-                summary_parts.append(f"Result: {result_preview}")
+                result_text = _tool_result_text(content[0])
+                if len(result_text) > MAX_JUDGE_TOOL_RESULT_CHARS:
+                    result_text = result_text[:MAX_JUDGE_TOOL_RESULT_CHARS] + "...[truncated]"
+                summary_parts.append(f"Result: {result_text}")
         elif role == "user":
             content = msg.get("content", [])
             if content:
                 user_text = str(content[0])
-                if len(user_text) > 2000:
-                    user_text = user_text[:2000] + "...[truncated]"
+                if len(user_text) > MAX_JUDGE_USER_TEXT_CHARS:
+                    user_text = user_text[:MAX_JUDGE_USER_TEXT_CHARS] + "...[truncated]"
                 summary_parts.append(f"User: {user_text}")
         for part in summary_parts[parts_before:]:
             total_chars += len(part) + 1
@@ -734,8 +745,6 @@ def _read_workspace_files(workspace_path: str) -> str:
         "AGENTS.md",
     }
     skip_dirs = {".git", ".openclaw", "__pycache__", "node_modules", "skills"}
-    max_chars = 4000
-    head_tail_chars = 2000
     file_contents: List[str] = []
     total_chars = 0
     omitted = 0
@@ -750,12 +759,6 @@ def _read_workspace_files(workspace_path: str) -> str:
             continue
         try:
             content = f.read_text(encoding="utf-8")
-            if len(content) > max_chars:
-                content = (
-                    f"{content[:head_tail_chars]}"
-                    "\n\n... [truncated, showing first 2000 and last 2000 characters] ...\n\n"
-                    f"{content[-head_tail_chars:]}"
-                )
             entry = f"### File: {rel}\n{content}"
             if total_chars + len(entry) > MAX_JUDGE_WORKSPACE_CHARS:
                 omitted += 1

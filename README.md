@@ -227,7 +227,8 @@ Notes:
 - `run_index` is the 1-based execution index within `--runs N` for that task.
 - `messages` is normalized into a training-friendly conversation format including `system`, `user`, `assistant`, and `tool` messages when present.
 - `tools` is included only when that model call exposed tool schemas.
-- The recorder currently supports benchmarked providers using `openai-completions` and `anthropic-messages` APIs.
+- The recorder supports benchmarked providers using `openai-completions` and `anthropic-messages` APIs.
+- Bundled OpenRouter models (`openrouter/...`) are recorded through that chat-completions proxy. The per-agent provider uses the main agent's OpenRouter API-key profile when one is configured, and otherwise `OPENROUTER_API_KEY`.
 
 ## Links
 
