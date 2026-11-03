@@ -1,34 +1,210 @@
-# PinchBench Runner Image
-# Pre-installs OpenClaw and dependencies for running benchmarks in CI
+# PinchBench Runner Image (+ local vLLM inference)
+# Pre-installs OpenClaw and dependencies for running benchmarks, and bundles
+# vLLM so a local model (e.g. Gemma-4 26B-A4B) can be served inside the
+# same container on a GPU node (e.g. SLURM 1 node x 8 H100 via enroot/Pyxis).
+#
+# Base: official vLLM OpenAI image, default CUDA 13.0 build
+#   vllm 0.32.0 / torch 2.13.0 / CUDA 13.0.2 / Python 3.12 / Ubuntu 24.04
+#   Needs host NVIDIA driver >= R580 (CUDA 13.0).
+#   https://github.com/vllm-project/vllm/releases/tag/v0.32.0
+#
+# Build (not done automatically):
+#   docker build -f Dockerfile.benchmark -t pinchbench-vllm:0.32.0 .
+#   enroot import -o pinchbench-vllm.sqsh dockerd://pinchbench-vllm:0.32.0
 
-FROM node:22-bookworm
+ARG VLLM_IMAGE=vllm/vllm-openai:v0.32.0-ubuntu2404
+ARG NODE_IMAGE=node:22-bookworm
+
+FROM ${NODE_IMAGE} AS node
+
+FROM ${VLLM_IMAGE}
 
 LABEL org.opencontainers.image.source="https://github.com/pinchbench/skill"
-LABEL org.opencontainers.image.description="PinchBench benchmark runner with OpenClaw"
+LABEL org.opencontainers.image.description="PinchBench benchmark runner with OpenClaw + vLLM (local model serving)"
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
     git \
     curl \
     jq \
+    procps \
+    ca-certificates \
+    gnupg \
+    openssl \
+    sqlite3 \
+    poppler-utils \
+    unzip \
+    zip \
+    file \
+    wget \
     && rm -rf /var/lib/apt/lists/*
+# openssl: fws generates its MITM CA with the openssl CLI on first `fws server start`
+# poppler-utils (pdftotext/pdfinfo): PDF tasks (contract_analysis, eli5_pdf_summary,
+#   openclaw_comprehension, pdf_to_calendar); sqlite3/zip/unzip/file: general agent tooling
+
+# Node.js 22 (same runtime as the previous node:22-bookworm base)
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=node /usr/local/include/node /usr/local/include/node
+RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && ln -sf ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack \
+    && node --version && npm --version
 
 # Install uv (Python package manager used by PinchBench)
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+# Installed into /usr/local/bin (not /root/.local/bin) so it also works when
+# Pyxis/enroot runs the container as the (non-root) SLURM user.
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh \
+    && uv --version
 ENV PATH="/root/.local/bin:$PATH"
 
 # Install OpenClaw globally
-RUN npm install -g openclaw
+RUN npm install -g openclaw@2026.5.28
+
+# ---------------------------------------------------------------------------
+# Task prerequisites (tasks/*.md `prerequisites:` + implicit needs)
+# ---------------------------------------------------------------------------
+ARG FWS_VERSION=0.4.4
+ARG GWS_VERSION=0.22.5
+ARG GWS_SHA256=de78ecdbd2f1a84cca0063a7ecbc440240fc14b6ebccbb17f4646b792a8c5c1f
+
+# gh CLI (prerequisite cli:gh -> task_gh_issue_triage), official apt repo
+# https://github.com/cli/cli/blob/trunk/docs/install_linux.md
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# gws = Google Workspace CLI (prerequisite cli:gws -> task_gws_*), prebuilt
+# release binary with checksum check. https://github.com/googleworkspace/cli/releases
+RUN set -eux; \
+    f=google-workspace-cli-x86_64-unknown-linux-gnu.tar.gz; \
+    curl -fsSL -o /tmp/$f https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/$f; \
+    echo "${GWS_SHA256}  /tmp/$f" | sha256sum -c -; \
+    tar -xzf /tmp/$f -C /tmp ./gws; \
+    install -m 0755 /tmp/gws /usr/local/bin/gws; \
+    rm -f /tmp/$f /tmp/gws
+
+# fws = Fake Web Services mock for gws/gh (prerequisite npm:@juppytt/fws).
+# scripts/lib_fws.py runs `fws server start` per task when it is on PATH.
+RUN npm install -g @juppytt/fws@${FWS_VERSION}
+
+# Smoke-test fws + gh + gws end to end at build time. On first start fws
+# downloads Google API discovery docs into ~/.local/share/fws/discovery-cache;
+# keep a copy under /opt so GPU nodes without internet (and non-root users)
+# reuse it via GWS_SOURCE_CONFIG_DIR. The build-time CA (incl. private key) is
+# deleted afterwards; fws regenerates one per user on first start at runtime.
+ENV GWS_SOURCE_CONFIG_DIR=/opt/fws/gws-discovery
+RUN set -eux; \
+    export FWS_DATA_DIR=/tmp/fws-build; \
+    fws server start > /tmp/fws-start.log 2>&1 || { cat /tmp/fws-start.log; exit 1; }; \
+    eval "$(fws server env)"; \
+    gh api /user | grep -q '"login"'; \
+    GH_REPO=testuser/my-project gh issue list | grep -q 'Fix login bug'; \
+    gws gmail +triage > /tmp/gws-triage.out 2>&1 || { cat /tmp/gws-triage.out; exit 1; }; \
+    gws drive files list | grep -q '"files"'; \
+    fws server stop; \
+    mkdir -p "$GWS_SOURCE_CONFIG_DIR/cache"; \
+    cp /root/.local/share/fws/discovery-cache/*.json "$GWS_SOURCE_CONFIG_DIR/cache/"; \
+    chmod -R a+rX /opt/fws; \
+    rm -rf /tmp/fws-build /tmp/fws-start.log /tmp/gws-triage.out /root/.local/share/fws
+
+# gh needs a token even against the fws mock. `fws server env` exports
+# GH_TOKEN=fake, but scripts/lib_fws.py only forwards GOOGLE_WORKSPACE_CLI_*,
+# HTTPS_PROXY and SSL_CERT_FILE, so set it image-wide (override with a real
+# token via `--export GH_TOKEN=...` if a task should hit real GitHub).
+# NO_PROXY keeps the local vLLM endpoint off the fws MITM proxy.
+ENV GH_TOKEN=fake \
+    NO_PROXY=localhost,127.0.0.1,::1 \
+    no_proxy=localhost,127.0.0.1,::1
+
+# Python packages the benchmarked agent typically needs inside the workspace
+# (system python3, the one OpenClaw's exec tool sees). Constrained to the
+# versions already installed by the vLLM image so vLLM/torch are untouched.
+#   pytest            task_test_generation (agent runs its tests)
+#   openpyxl, pandas  task_spreadsheet_summary (.xlsx) + csv_* / log_* analysis
+#   pypdf, pdfplumber task_contract_analysis, task_eli5_pdf_summary,
+#                     task_openclaw_comprehension, task_pdf_to_calendar
+#   icalendar         task_pdf_to_calendar (.ics output)
+#   playwright        task_browser_automation, task_playwright_e2e, task_selector_fix
+#   requests, bs4     task_weather (wttr.in), task_workflow, research tasks
+#   yt-dlp, youtube-transcript-api  task_video_transcript_extraction
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN set -eux; \
+    uv pip freeze --system | grep -E '^[A-Za-z0-9_.-]+==' > /tmp/vllm-constraints.txt; \
+    uv pip install --system --break-system-packages -c /tmp/vllm-constraints.txt \
+        pytest openpyxl pandas numpy matplotlib pypdf pdfplumber icalendar \
+        python-dateutil tabulate pyyaml requests beautifulsoup4 lxml pillow \
+        playwright yt-dlp youtube-transcript-api; \
+    python3 -m playwright install --with-deps chromium; \
+    chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH"; \
+    rm -f /tmp/vllm-constraints.txt; \
+    rm -rf /var/lib/apt/lists/*
+
+# Gemma-4 tool/reasoning chat template shipped with the vLLM image
+ENV VLLM_GEMMA4_CHAT_TEMPLATE=/vllm-workspace/examples/tool_chat_template_gemma4.jinja
+
+# Helper: start vLLM on a local model in background, wait for /health, run a command
+# pinchbench_env.sh is sourced by serve_vllm.sh and scripts/run.sh: it puts all
+# temp/cache/state/log paths under $PINCHBENCH_WORKDIR (read-only image,
+# non-root user, unreliable /tmp on SLURM + enroot/Pyxis).
+COPY scripts/serve_vllm.sh scripts/pinchbench_env.sh /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/serve_vllm.sh /usr/local/bin/pinchbench_env.sh
+
+# fws' MITM proxy hard-codes /tmp/fws-cert-*; make it honour $TMPDIR (see script)
+COPY scripts/docker/patch_fws_tmpdir.py /tmp/patch_fws_tmpdir.py
+RUN python3 /tmp/patch_fws_tmpdir.py && rm -f /tmp/patch_fws_tmpdir.py
+
+# Sanity check: vLLM / torch / CUDA versions, Gemma-4 support, template, CLIs
+RUN python3 -c "import torch, vllm; \
+print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda', torch.version.cuda); \
+assert vllm.__version__.startswith('0.32'), vllm.__version__; \
+assert torch.version.cuda is not None, 'torch has no CUDA'" \
+    && python3 -c "import vllm.model_executor.models.gemma4, vllm.tool_parsers, vllm.reasoning; print('gemma4 OK')" \
+    && test -f "$VLLM_GEMMA4_CHAT_TEMPLATE" \
+    && openclaw --version && uv --version && jq --version
+
+# Sanity check: task prerequisites (fws / gws / gh / CLIs / Python packages / browser)
+RUN set -eux; \
+    fws --version; gws --version; gh --version; git --version; \
+    sqlite3 --version; pdftotext -v; openssl version; \
+    test -s "$GWS_SOURCE_CONFIG_DIR/cache/gmail_v1.json"; \
+    python3 -c "import pytest, openpyxl, pandas, numpy, matplotlib, pypdf, pdfplumber, icalendar, \
+dateutil, tabulate, yaml, requests, bs4, lxml, PIL, playwright.sync_api, yt_dlp, \
+youtube_transcript_api; print('python task deps OK')"; \
+    python3 -c "from playwright.sync_api import sync_playwright as s; \
+p = s().start(); b = p.chromium.launch(); pg = b.new_page(); \
+pg.set_content('<h1>ok</h1>'); assert pg.inner_text('h1') == 'ok'; b.close(); p.stop(); \
+print('playwright chromium OK')"; \
+    python3 -c "import torch, vllm; print('vllm', vllm.__version__, 'torch', torch.__version__)"
 
 # Create workspace directory
 WORKDIR /workspace
 
-# Pre-create OpenClaw config directory
+# Pre-create OpenClaw config directory (root/docker use only; SLURM users get
+# $HOME/.openclaw or $PINCHBENCH_WORKDIR/openclaw via pinchbench_env.sh)
 RUN mkdir -p /root/.openclaw
 
-# Default entrypoint - can be overridden
+# Let a non-root SLURM user (Pyxis default) use uv's shared cache/python dirs
+RUN mkdir -p /opt/uv/cache /opt/uv/python && chmod -R a+rwX /opt/uv
+
+# Defaults for serve_vllm.sh (override with env / srun --export)
+# PINCHBENCH_IMAGE=1 makes scripts/run.sh use this image's system python3
+# (has pyyaml/pytest + all task deps) instead of a uv-managed throw-away env.
+ENV MODEL_PATH=/models/gemma-4-26B-A4B-it \
+    PINCHBENCH_IMAGE=1 \
+    SERVED_MODEL_NAME=gemma-4-26b-a4b-it \
+    VLLM_PORT=8000 \
+    TP=8 \
+    OPENAI_API_KEY=EMPTY
+
+# Default entrypoint - can be overridden (base image's `vllm serve` entrypoint is replaced)
 ENTRYPOINT ["/bin/bash", "-c"]
-CMD ["openclaw --version && echo 'Ready for benchmarks'"]
+CMD ["openclaw --version && python3 -c 'import vllm; print(\"vllm\", vllm.__version__)' && echo 'Ready for benchmarks'"]

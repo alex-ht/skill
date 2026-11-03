@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from urllib import error, parse, request
 
 from lib_fws import is_fws_task, fws_available, start_fws, stop_fws
+from lib_paths import openclaw_config_path, openclaw_state_dir, run_root as _pb_run_root
 from lib_tasks import Task
 from lib_train_recorder import supports_recording_api
 
@@ -242,7 +243,7 @@ def _get_agent_workspace(agent_id: str) -> Path | None:
 
 
 def _openclaw_config_path() -> Path:
-    return Path.home() / ".openclaw" / "openclaw.json"
+    return openclaw_config_path()
 
 
 def _load_openclaw_config() -> Dict[str, Any]:
@@ -754,7 +755,7 @@ def build_openrouter_recording_provider(
     profile. The env marker is stored instead of the environment value.
     """
     profile_path = (
-        Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
+        openclaw_state_dir() / "agents" / "main" / "agent" / "auth-profiles.json"
         if auth_profiles_path is None
         else auth_profiles_path
     )
@@ -767,7 +768,7 @@ def build_openrouter_recording_provider(
         return None
 
     catalog_path = (
-        Path.home() / ".openclaw" / "cache" / "openrouter-models.json"
+        openclaw_state_dir() / "cache" / "openrouter-models.json"
         if cache_path is None
         else cache_path
     )
@@ -855,6 +856,128 @@ def resolve_recording_provider(
     )
 
 
+_ENV_STYLE_API_KEY = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_LOCAL_API_HOSTS = frozenset(
+    {
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+        "host.docker.internal",
+    }
+)
+
+
+def _api_key_text(api_key: Any) -> str:
+    return api_key.strip() if isinstance(api_key, str) else ""
+
+
+def _api_key_is_env_marker(api_key: Any) -> bool:
+    """True when ``apiKey`` is an env-var name, not a secret OpenClaw can send."""
+    return _ENV_STYLE_API_KEY.fullmatch(_api_key_text(api_key)) is not None
+
+
+def _env_marker_is_set(api_key: Any, env: Mapping[str, str]) -> bool:
+    marker = _api_key_text(api_key)
+    return bool(marker) and bool(str(env.get(marker) or "").strip())
+
+
+def _is_local_provider_base_url(base_url: Any) -> bool:
+    if not isinstance(base_url, str) or not base_url.strip():
+        return False
+    host = parse.urlparse(base_url.strip()).hostname or ""
+    host = host.lower()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return host in _LOCAL_API_HOSTS or host.endswith(".local")
+
+
+def _auth_profile_api_key(auth_profiles_path: Path, provider_name: str) -> Optional[str]:
+    if not auth_profiles_path.is_file():
+        return None
+    try:
+        data = json.loads(auth_profiles_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not read auth profiles at %s", auth_profiles_path)
+        return None
+    profiles = data.get("profiles") if isinstance(data, dict) else None
+    if not isinstance(profiles, dict):
+        return None
+    preferred_id = f"{provider_name}:default"
+    ordered: List[tuple[str, Dict[str, Any]]] = []
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile, dict):
+            continue
+        if profile.get("provider") != provider_name or profile.get("type") != "api_key":
+            continue
+        ordered.append((str(profile_id), profile))
+    ordered.sort(key=lambda item: (item[0] != preferred_id, item[0]))
+    for _profile_id, profile in ordered:
+        key = profile.get("key")
+        if isinstance(key, str) and key.strip():
+            return key.strip()
+    return None
+
+
+def install_recording_provider_auth(
+    *,
+    recording_provider_id: str,
+    source_provider_name: str,
+    provider: Dict[str, Any],
+    auth_store_path: Path,
+    source_auth_profiles_path: Path,
+    env: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Give a ``trainrec-*`` provider a key OpenClaw will actually send.
+
+    OpenClaw 2026.5+ treats an all-caps ``apiKey`` such as ``SGLANG_API_KEY`` as
+    an env marker. When that variable is unset it looks up an auth profile for
+    the *new* provider id, misses, and never issues the HTTP request. A literal
+    key already in ``provider`` is left alone. Otherwise the source provider's
+    ``api_key`` profile is copied onto the bench agent. A loopback provider with
+    neither a key nor a profile drops ``apiKey`` so OpenClaw uses its local
+    no-auth marker.
+
+    Returns ``literal``, ``env``, ``profile``, ``local``, or ``missing``.
+    """
+    env_map: Mapping[str, str] = os.environ if env is None else env
+    api_key = provider.get("apiKey")
+    if _api_key_text(api_key) and not _api_key_is_env_marker(api_key):
+        return "literal"
+    if _api_key_is_env_marker(api_key) and _env_marker_is_set(api_key, env_map):
+        return "env"
+
+    copied_key = _auth_profile_api_key(source_auth_profiles_path, source_provider_name)
+    if copied_key:
+        auth_store_path.parent.mkdir(parents=True, exist_ok=True)
+        data: Dict[str, Any] = {}
+        if auth_store_path.is_file():
+            try:
+                loaded = json.loads(auth_store_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, json.JSONDecodeError):
+                logger.warning("Replacing unreadable auth store at %s", auth_store_path)
+                data = {}
+        profiles = data.get("profiles")
+        if not isinstance(profiles, dict):
+            profiles = {}
+            data["profiles"] = profiles
+        data["version"] = data.get("version") or 1
+        profiles[f"{recording_provider_id}:default"] = {
+            "type": "api_key",
+            "provider": recording_provider_id,
+            "key": copied_key,
+        }
+        auth_store_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        return "profile"
+
+    if _is_local_provider_base_url(provider.get("baseUrl")):
+        provider.pop("apiKey", None)
+        return "local"
+    return "missing"
+
+
 def _configure_recording_provider_for_agent(
     *,
     agent_id: str,
@@ -878,6 +1001,27 @@ def _configure_recording_provider_for_agent(
     recording_model_ref = f"{recording_provider_id}/{model_id}"
     provider_copy = json.loads(json.dumps(selected_provider, ensure_ascii=False))
     provider_copy["baseUrl"] = proxy_base_url
+    auth_store_path = _get_agent_store_dir(agent_id) / "agent" / "auth-profiles.json"
+    source_auth_path = openclaw_state_dir() / "agents" / "main" / "agent" / "auth-profiles.json"
+    auth_status = install_recording_provider_auth(
+        recording_provider_id=recording_provider_id,
+        source_provider_name=selected_provider_name,
+        provider=provider_copy,
+        auth_store_path=auth_store_path,
+        source_auth_profiles_path=source_auth_path,
+    )
+    logger.info(
+        "Recording provider auth for %s on agent %s: %s",
+        recording_provider_id,
+        agent_id,
+        auth_status,
+    )
+    if auth_status == "missing":
+        logger.warning(
+            "No API key for recording provider %s (source %s); the model request may not be sent",
+            recording_provider_id,
+            selected_provider_name,
+        )
     providers[recording_provider_id] = provider_copy
 
     original_model_ref = f"{selected_provider_name}/{model_id}"
@@ -1008,7 +1152,7 @@ def ensure_agent_exists(
     bench_agent_dir = _get_agent_store_dir(agent_id) / "agent"
     bench_agent_dir.mkdir(parents=True, exist_ok=True)
     bench_models = bench_agent_dir / "models.json"
-    main_models = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "models.json"
+    main_models = openclaw_state_dir() / "agents" / "main" / "agent" / "models.json"
 
     data: dict[str, Any] = {}
     if main_models.exists():
@@ -1173,7 +1317,7 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
         if fallback_match:
             benchmark_run_id, _, run_index = fallback_match.groups()
             workspace = (
-                Path("/tmp/pinchbench")
+                _pb_run_root()
                 / benchmark_run_id
                 / "workspaces"
                 / task.task_id
@@ -1185,7 +1329,7 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
             )
         else:
             logger.warning("Could not find agent workspace, using legacy fallback")
-            workspace = Path(f"/tmp/pinchbench/{run_id}/{task.task_id}")
+            workspace = _pb_run_root() / run_id / task.task_id
 
     # openclaw agents add seeds BOOTSTRAP.md into every new workspace as a
     # first-run ritual. Do not snapshot or restore that seed. Copy it only when
@@ -1217,7 +1361,7 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
     workspace.mkdir(parents=True, exist_ok=True)
 
     # Copy latest bootstrap files from main workspace (so AGENTS.md edits take effect immediately)
-    main_workspace = Path.home() / ".openclaw" / "workspace"
+    main_workspace = openclaw_state_dir() / "workspace"
     for fname in _BOOTSTRAP_FILES + _MAIN_ONLY_FILES:
         src = main_workspace / fname
         if src.exists():
@@ -1229,7 +1373,8 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
 
     # Copy workspace_files declared in the task definition
     if not task.workspace_files:
-        logger.warning("Task %s has no workspace_files defined", task.task_id)
+        # Many tasks legitimately start from an empty workspace; not a problem.
+        logger.debug("Task %s has no workspace_files defined", task.task_id)
     else:
         logger.info("Task %s has %d workspace_files to copy", task.task_id, len(task.workspace_files))
 
@@ -1268,7 +1413,7 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
 
     # Copy skills from main workspace to benchmark workspace
     # This enables benchmark agents to use installed skills like nano-pdf
-    main_skills_dir = Path.home() / ".openclaw" / "workspace" / "skills"
+    main_skills_dir = openclaw_state_dir() / "workspace" / "skills"
     if main_skills_dir.exists():
         dest_skills_dir = workspace / "skills"
         dest_skills_dir.mkdir(parents=True, exist_ok=True)
@@ -1293,7 +1438,7 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
 
 
 def _get_agent_store_dir(agent_id: str) -> Path:
-    base_dir = Path.home() / ".openclaw" / "agents"
+    base_dir = openclaw_state_dir() / "agents"
     normalized_id = agent_id.replace(":", "-").lower()
     direct_dir = base_dir / agent_id
     normalized_dir = base_dir / normalized_id
@@ -1733,7 +1878,12 @@ def execute_openclaw_task(
         if not fws_available():
             logger.warning("⚠️ Task %s requires fws but it's not installed (npm install -g @juppytt/fws)", task.task_id)
         else:
-            fws_env = start_fws()
+            try:
+                fws_env = start_fws()
+            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                # Do not abort the whole benchmark; the task runs without the
+                # mock and the error stays visible in the log.
+                logger.error("❌ fws unavailable for %s: %s", task.task_id, exc)
 
     # Use --local so dynamically-created bench agents bypass the gateway
     # (gateway only recognises pre-registered agents; fws tasks also need it

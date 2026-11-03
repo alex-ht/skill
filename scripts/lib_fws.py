@@ -10,6 +10,9 @@ import os
 import shutil
 import subprocess
 import time
+from pathlib import Path
+
+from lib_paths import pinchbench_workdir
 
 logger = logging.getLogger("pinchbench")
 
@@ -19,7 +22,25 @@ MOCK_GWS_ENV_KEYS = [
     "GOOGLE_WORKSPACE_CLI_TOKEN",
     "HTTPS_PROXY",
     "SSL_CERT_FILE",
+    "GH_TOKEN",  # `fws server env` exports GH_TOKEN=fake; gh refuses to run without a token
 ]
+
+# Ports are configurable so two jobs sharing a node do not collide on 4100/4101.
+FWS_PORT = int(os.environ.get("PINCHBENCH_FWS_PORT", "4100"))
+FWS_PROXY_PORT = int(os.environ.get("PINCHBENCH_FWS_PROXY_PORT", str(FWS_PORT + 1)))
+
+
+def fws_data_dir() -> Path:
+    """fws state (config, certs, server.json, log). Kept out of ~/.local/share
+    so a read-only / shared HOME works; override with FWS_DATA_DIR."""
+    explicit = (os.environ.get("FWS_DATA_DIR") or "").strip()
+    return Path(explicit) if explicit else pinchbench_workdir() / "fws"
+
+
+def _fws_subprocess_env() -> dict:
+    env = os.environ.copy()
+    env["FWS_DATA_DIR"] = str(fws_data_dir())
+    return env
 
 
 def is_fws_task(frontmatter: dict) -> bool:
@@ -42,22 +63,32 @@ def start_fws() -> dict:
     """
     logger.info("🔧 Starting fws server...")
 
-    # Stop any existing server
-    subprocess.run(["fws", "server", "stop"], capture_output=True, check=False)
+    data_dir = fws_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    env = _fws_subprocess_env()
+
+    # Stop any existing server (only the one owned by this data dir)
+    subprocess.run(["fws", "server", "stop"], capture_output=True, check=False, env=env)
     time.sleep(0.3)
 
     # Start server
     result = subprocess.run(
-        ["fws", "server", "start"],
+        ["fws", "server", "start", "-p", str(FWS_PORT), "--proxy-port", str(FWS_PROXY_PORT)],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=60,
         check=False,
+        env=env,
     )
 
-    if result.returncode != 0:
-        logger.error("Failed to start fws: %s", result.stderr)
-        raise RuntimeError(f"fws server start failed: {result.stderr}")
+    # fws 0.4.x exits 0 even when the health check fails ("Failed to start
+    # server." on stderr), so check stdout too instead of silently continuing
+    # with a dead mock.
+    if result.returncode != 0 or "fws server started" not in result.stdout:
+        detail = (result.stderr or result.stdout or "").strip()
+        log_file = data_dir / "server.log"
+        logger.error("Failed to start fws (data dir %s): %s", data_dir, detail[-2000:])
+        raise RuntimeError(f"fws server start failed (see {log_file}): {detail[-500:]}")
 
     # Parse the env vars from output
     env_vars = {}
@@ -70,14 +101,16 @@ def start_fws() -> dict:
             env_vars[key.strip()] = value.strip()
 
     if not env_vars:
-        # Fallback: use default paths
-        home = os.path.expanduser("~")
+        # Fallback: same values `fws server env` would print
         env_vars = {
-            "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": f"{home}/.local/share/fws/config",
+            "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": str(data_dir / "config"),
             "GOOGLE_WORKSPACE_CLI_TOKEN": "fake",
-            "HTTPS_PROXY": "http://localhost:4101",
-            "SSL_CERT_FILE": f"{home}/.local/share/fws/certs/ca.crt",
+            "HTTPS_PROXY": f"http://localhost:{FWS_PROXY_PORT}",
+            "SSL_CERT_FILE": str(data_dir / "certs" / "ca-bundle.crt"),
+            "GH_TOKEN": "fake",
         }
+    # Child tools must find the same fws instance (e.g. `fws` called by the agent).
+    env_vars.setdefault("FWS_DATA_DIR", str(data_dir))
 
     # Save original values and set new ones
     original_env = {}
@@ -85,7 +118,8 @@ def start_fws() -> dict:
         original_env[key] = os.environ.get(key)
         os.environ[key] = value
 
-    logger.info("✅ fws server started, env configured")
+    logger.info("✅ fws server started on :%d/:%d (data %s), env configured",
+                FWS_PORT, FWS_PROXY_PORT, data_dir)
     return original_env
 
 
@@ -93,7 +127,9 @@ def stop_fws(original_env: dict) -> None:
     """Stop the fws server and restore original environment variables."""
     logger.info("🔧 Stopping fws server...")
 
-    subprocess.run(["fws", "server", "stop"], capture_output=True, check=False)
+    subprocess.run(
+        ["fws", "server", "stop"], capture_output=True, check=False, env=_fws_subprocess_env()
+    )
 
     # Restore original env
     for key, value in original_env.items():

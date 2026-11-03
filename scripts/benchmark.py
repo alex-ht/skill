@@ -9,6 +9,7 @@ from the tasks/ directory.
 # requires-python = ">=3.10"
 # dependencies = [
 #     "pyyaml>=6.0.1",
+#     "pytest>=7.4.0",  # task graders run `sys.executable -m pytest` (task_test_generation)
 # ]
 # ///
 
@@ -49,15 +50,30 @@ from lib_grading import (
     get_judge_cache_stats,
     clear_judge_cache,
 )
+from lib_paths import ensure_tmpdir, pinchbench_workdir, run_root as pb_run_root
 from lib_tasks import Task, TaskLoader
 from lib_train_recorder import TrainingRecorder
+
+
+def _benchmark_log_handler() -> logging.Handler:
+    """benchmark.log goes to $PINCHBENCH_LOG_DIR when set (one per job, so
+    concurrent SLURM jobs do not interleave in a shared checkout), else the
+    current directory as before. Falls back to stderr-only if unwritable."""
+    log_dir = os.environ.get("PINCHBENCH_LOG_DIR", "").strip()
+    path = Path(log_dir) / "benchmark.log" if log_dir else Path("benchmark.log")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return logging.FileHandler(path)
+    except OSError as exc:
+        print(f"WARNING: cannot write {path} ({exc}); file logging disabled", file=sys.stderr)
+        return logging.NullHandler()
 
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("benchmark.log")],
+    handlers=[logging.StreamHandler(sys.stdout), _benchmark_log_handler()],
 )
 
 logger = logging.getLogger("benchmark")
@@ -461,12 +477,23 @@ def _load_continue_state(
     return run_id, remaining_tasks, restored_results, grades_by_task_id
 
 
-def _next_run_id(run_root: Path) -> str:
+def _next_run_id(run_root: Path, output_dir: Optional[Path] = None) -> str:
+    """Next free 4-digit run id.
+
+    Also scans *output_dir* for ``NNNN_*`` results/transcripts: with a fresh
+    per-job work dir (SLURM) the run root is always empty, and reusing 0001
+    would overwrite earlier results written to the same output dir.
+    """
     run_root.mkdir(parents=True, exist_ok=True)
     existing = []
     for entry in run_root.iterdir():
         if entry.is_dir() and entry.name.isdigit():
             existing.append(int(entry.name))
+    if output_dir is not None and output_dir.is_dir():
+        for entry in output_dir.iterdir():
+            m = re.match(r"^(\d{4,})_", entry.name)
+            if m:
+                existing.append(int(m.group(1)))
     next_id = (max(existing) + 1) if existing else 1
     return f"{next_id:04d}"
 
@@ -1004,6 +1031,9 @@ def main():
     script_dir = Path(__file__).parent
     skill_root = script_dir.parent  # Parent of scripts/ is the skill root
     tasks_dir = skill_root / "tasks"
+    # Keep every temp file (grading snapshots, judge prompts, child processes)
+    # off a possibly shared/small /tmp: TMPDIR -> $PINCHBENCH_WORKDIR/tmp.
+    ensure_tmpdir()
 
     logger.info("🦞🦀🦐 PinchBench - OpenClaw Benchmarking")
     ascii_crab = _load_ascii_art(skill_root, "crab.txt")
@@ -1074,8 +1104,10 @@ def main():
     runner.load_tasks()
 
     model_slug = slugify_model(args.model)
-    run_root = Path("/tmp/pinchbench")
-    run_id = _next_run_id(run_root)
+    run_root = pb_run_root()
+    run_id = _next_run_id(run_root, Path(args.output_dir))
+    logger.info("Work dir: %s (run root %s, TMPDIR %s)", pinchbench_workdir(), run_root,
+                os.environ.get("TMPDIR", ""))
     benchmark_run_dir = run_root / run_id
     skill_dir = skill_root
     # Each task/run gets its own workspace and a short unique agent ID so no

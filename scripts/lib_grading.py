@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from lib_agent import call_judge_api, ensure_agent_exists, run_openclaw_prompt, slugify_model
+from lib_paths import judge_root
 from lib_tasks import Task
 
 
@@ -269,7 +270,7 @@ def _grade_automated(
 
 _PRIVATE_IMAGE_KEY_FILENAME = "image_classification_answer_key.json"
 _PRIVATE_IMAGE_KEY_RUNTIME_PATH = (
-    Path("/tmp/pinchbench/judge/private") / _PRIVATE_IMAGE_KEY_FILENAME
+    judge_root() / "private" / _PRIVATE_IMAGE_KEY_FILENAME
 )
 
 
@@ -491,7 +492,7 @@ def _grade_llm_judge(
                 # Default: OpenClaw agent session
                 judge_skill_dir = skill_dir if skill_dir is not None else Path.cwd()
                 agent_id = _ensure_judge_agent(judge_agent_prefix, active_model, judge_skill_dir)
-                judge_workspace = Path(f"/tmp/pinchbench/judge/{task.task_id}")
+                judge_workspace = judge_root() / task.task_id
                 judge_result = run_openclaw_prompt(
                     agent_id=agent_id,
                     prompt=prompt,
@@ -812,7 +813,7 @@ def _build_judge_prompt(
 def _ensure_judge_agent(judge_agent_prefix: str, judge_model: str, skill_dir: Path) -> str:
     model_slug = slugify_model(judge_model)
     agent_id = f"{judge_agent_prefix}-{model_slug}"
-    workspace = Path("/tmp/pinchbench/judge/workspace")
+    workspace = judge_root() / "workspace"
     ensure_agent_exists(agent_id, judge_model, workspace)
     return agent_id
 
