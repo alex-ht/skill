@@ -142,6 +142,10 @@ class GradeResult:
     grading_type: str
     breakdown: Dict[str, float]
     notes: str
+    # True when the score is NOT a measurement of the agent: the LLM judge (or
+    # the grading machinery) failed and ``score`` is only a 0.0 placeholder.
+    # RL consumers should mask such samples instead of training on reward 0.
+    judge_failed: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -151,6 +155,7 @@ class GradeResult:
             "grading_type": self.grading_type,
             "breakdown": self.breakdown,
             "notes": self.notes,
+            "judge_failed": self.judge_failed,
         }
 
 
@@ -600,6 +605,7 @@ def _grade_llm_judge(
         grading_type="llm_judge",
         breakdown=_normalize_score_dict(breakdown),
         notes=str(notes) if notes is not None else "",
+        judge_failed=total is None,
     )
 
     # Cache successful results (only if we got a valid score)
@@ -638,6 +644,7 @@ def _combine_grades(task: Task, auto_result: GradeResult, llm_result: GradeResul
         grading_type="hybrid",
         breakdown=breakdown,
         notes=notes,
+        judge_failed=bool(auto_result.judge_failed or llm_result.judge_failed),
     )
 
 

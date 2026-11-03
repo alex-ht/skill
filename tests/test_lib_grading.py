@@ -426,6 +426,46 @@ class JudgeFallbackContextLengthTests(unittest.TestCase):
         self.assertEqual(sleep_mock.call_count, 1)
         self.assertAlmostEqual(result.score, 0.8)
 
+    def test_judge_failure_is_flagged_not_scored(self) -> None:
+        def fake_call_judge_api(**kwargs):
+            return {"status": "error", "text": "", "error": "HTTP 500: boom"}
+
+        with (
+            patch("lib_grading.call_judge_api", side_effect=fake_call_judge_api),
+            patch("lib_grading.time.sleep"),
+        ):
+            result = _grade_llm_judge(
+                task=_make_judge_task(),
+                execution_result={"transcript": _assistant_transcript(), "status": "success"},
+                judge_model="gpt-5.4-mini",
+                judge_fallback_model="gpt-5.4",
+                judge_agent_prefix="bench-judge",
+                judge_timeout_seconds=30,
+                judge_backend="api",
+            )
+
+        self.assertTrue(result.judge_failed)
+        self.assertEqual(result.score, 0.0)
+        self.assertTrue(result.to_dict()["judge_failed"])
+
+    def test_judge_success_is_not_flagged(self) -> None:
+        with (
+            patch(
+                "lib_grading.call_judge_api",
+                return_value={"status": "success", "text": SUCCESS_JUDGE_TEXT},
+            ),
+            patch("lib_grading.time.sleep"),
+        ):
+            result = _grade_llm_judge(
+                task=_make_judge_task(),
+                execution_result={"transcript": _assistant_transcript(), "status": "success"},
+                judge_model="gpt-5.4-mini",
+                judge_agent_prefix="bench-judge",
+                judge_timeout_seconds=30,
+                judge_backend="api",
+            )
+        self.assertFalse(result.judge_failed)
+
 
 if __name__ == "__main__":
     unittest.main()

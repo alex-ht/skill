@@ -1287,6 +1287,7 @@ def main():
                 grading_type=pending_grade_task.grading_type,
                 breakdown={},
                 notes=f"Background grading failed: {exc}",
+                judge_failed=True,
             )
 
         # Log the grade
@@ -1509,6 +1510,7 @@ def main():
                         grading_type=task.grading_type,
                         breakdown={},
                         notes=note,
+                        judge_failed=True,
                     )
                 task_grades.append(grade)
                 result["run_index"] = run_index + 1
