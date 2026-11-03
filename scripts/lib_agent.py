@@ -525,6 +525,61 @@ def _disable_plugin_entry(config: Dict[str, Any], plugin_id: str) -> bool:
     return True
 
 
+def _web_search_provider_override() -> str:
+    """``PINCHBENCH_WEB_SEARCH_PROVIDER`` (e.g. ``tavily``, ``brave``); empty = leave as is."""
+    return os.environ.get("PINCHBENCH_WEB_SEARCH_PROVIDER", "").strip().lower()
+
+
+def _apply_web_tool_env_config(config: Dict[str, Any]) -> bool:
+    """Apply env-driven web tool settings to the global OpenClaw config.
+
+    * ``PINCHBENCH_WEB_SEARCH_PROVIDER`` pins ``tools.web.search.provider``.
+      With ``tavily`` the Tavily plugin entry stays enabled (it backs the
+      managed ``web_search`` tool, key from ``TAVILY_API_KEY``) while the
+      explicit ``tavily_search`` / ``tavily_extract`` tools stay denied, so the
+      agent's tool set is unchanged.
+    * ``PINCHBENCH_WEB_FETCH_MAX_CHARS`` sets ``tools.web.fetch.maxChars``.
+    Returns True if *config* was modified.
+    """
+    changed = False
+    tools = config.setdefault("tools", {})
+    if not isinstance(tools, dict):
+        tools = {}
+        config["tools"] = tools
+    web = tools.setdefault("web", {})
+    if not isinstance(web, dict):
+        web = {}
+        tools["web"] = web
+    provider = _web_search_provider_override()
+    if provider:
+        search = web.setdefault("search", {})
+        if not isinstance(search, dict):
+            search = {}
+            web["search"] = search
+        if search.get("enabled") is not True:
+            search["enabled"] = True
+            changed = True
+        if search.get("provider") != provider:
+            search["provider"] = provider
+            changed = True
+        if provider in DISABLED_PLUGIN_IDS:
+            entries = config.setdefault("plugins", {}).setdefault("entries", {})
+            meta = entries.setdefault(provider, {})
+            if meta.get("enabled") is not True:
+                meta["enabled"] = True
+                changed = True
+    max_chars = os.environ.get("PINCHBENCH_WEB_FETCH_MAX_CHARS", "").strip()
+    if max_chars:
+        fetch = web.setdefault("fetch", {})
+        if not isinstance(fetch, dict):
+            fetch = {}
+            web["fetch"] = fetch
+        if fetch.get("maxChars") != int(max_chars):
+            fetch["maxChars"] = int(max_chars)
+            changed = True
+    return changed
+
+
 def _merge_also_allow(tools: Dict[str, Any], plugin_ids: list[str]) -> bool:
     also_allow = tools.get("alsoAllow")
     if not isinstance(also_allow, list):
@@ -566,7 +621,9 @@ def _apply_plugin_tool_allowances(agent_id: str | None = None) -> bool:
         changed = True
     if _drop_allowed_tools_from_deny(global_tools):
         changed = True
-    if _disable_plugin_entry(config, "tavily"):
+    if _web_search_provider_override() != "tavily" and _disable_plugin_entry(config, "tavily"):
+        changed = True
+    if _apply_web_tool_env_config(config):
         changed = True
 
     if agent_id:

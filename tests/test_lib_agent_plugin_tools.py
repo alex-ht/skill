@@ -218,3 +218,25 @@ class ApplyPluginToolAllowancesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_web_tool_env_config_tavily_and_fetch_max_chars(monkeypatch):
+    import lib_agent
+
+    monkeypatch.setenv("PINCHBENCH_WEB_SEARCH_PROVIDER", "tavily")
+    monkeypatch.setenv("PINCHBENCH_WEB_FETCH_MAX_CHARS", "12000")
+    config = {"plugins": {"entries": {"tavily": {"enabled": False}}}}
+    assert lib_agent._apply_web_tool_env_config(config) is True
+    assert config["tools"]["web"]["search"] == {"enabled": True, "provider": "tavily"}
+    assert config["tools"]["web"]["fetch"]["maxChars"] == 12000
+    assert config["plugins"]["entries"]["tavily"]["enabled"] is True
+    assert lib_agent._apply_web_tool_env_config(config) is False
+
+
+def test_web_tool_env_config_noop_without_env(monkeypatch):
+    import lib_agent
+
+    monkeypatch.delenv("PINCHBENCH_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("PINCHBENCH_WEB_FETCH_MAX_CHARS", raising=False)
+    config = {}
+    assert lib_agent._apply_web_tool_env_config(config) is False
